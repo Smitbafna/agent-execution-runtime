@@ -12,13 +12,15 @@ from typing import Any, Iterator, Sequence
 
 from .exceptions import StorageError
 
-__all__ = ["SQLiteStore", "SCHEMA_STATEMENTS", "DbPath"]
+__all__ = ["SQLiteStore", "SCHEMA_STATEMENTS", "DbPath", "MEMORY"]
 
 DbPath = str | Path
 
 MEMORY = ":memory:"
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
+    # The append-only journal. UNIQUE (execution_id, sequence) is what keeps
+    # histories gapless; FOREIGN KEY support is enabled on every connection.
     """
     CREATE TABLE IF NOT EXISTS events (
         event_id     TEXT    NOT NULL PRIMARY KEY,
@@ -29,6 +31,32 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         timestamp    TEXT    NOT NULL,
         UNIQUE (execution_id, sequence)
     )
+    """,
+    # A checkpoint is the state of an execution immediately after `sequence`.
+    #
+    #   * the composite FOREIGN KEY pins the sequence to a row that really is in
+    #     the journal, so a checkpoint cannot reference an event that never
+    #     happened;
+    #   * UNIQUE (execution_id, sequence) keeps one snapshot per sequence, so a
+    #     committed checkpoint can never be half-overwritten by another;
+    #   * state is stored as JSON -- the checkpoint is a cache of the journal,
+    #     never an independent source of truth.
+    """
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        checkpoint_id TEXT    NOT NULL PRIMARY KEY,
+        execution_id  TEXT    NOT NULL,
+        sequence      INTEGER NOT NULL,
+        state         TEXT    NOT NULL,
+        created_at    TEXT    NOT NULL,
+        UNIQUE (execution_id, sequence),
+        FOREIGN KEY (execution_id, sequence) REFERENCES events (execution_id, sequence)
+    )
+    """,
+    # Recovery asks for "the newest checkpoint of this execution" on every
+    # resume; this index keeps that a single index seek.
+    """
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_execution
+        ON checkpoints (execution_id, sequence DESC)
     """,
 )
 
@@ -83,10 +111,20 @@ class SQLiteStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Run a block inside an ``IMMEDIATE`` transaction.
+        """Run a block of statements inside an ``IMMEDIATE`` transaction.
 
         ``IMMEDIATE`` takes the write lock straight away, which keeps concurrent
         writers from interleaving and losing sequence numbers.
+
+        Everything in the block commits together or not at all, which makes a
+        transaction a poor fit for two kinds of work:
+
+        * anything that has to be *split* across commits (a checkpoint has to be
+          one commit -- see :meth:`agent_runtime.checkpoints.CheckpointStore.create`);
+        * "check, then act" control flow. A ``finally`` block that swallowed an
+          error would commit the first statement anyway, so read what you need
+          to decide before opening one, or express the check in SQL as part of
+          the statement that writes.
         """
         conn = self.connection
         conn.execute("BEGIN IMMEDIATE")

@@ -19,28 +19,62 @@ from typing import Any, Mapping
 __all__ = [
     "EventType",
     "EVENT_TYPES",
+    "INCOMPLETE_EVENT_TYPES",
+    "TERMINAL_EVENT_TYPES",
     "Event",
     "describe_error",
+    "is_incomplete_event",
+    "is_terminal_event",
     "new_id",
     "utc_now_iso",
 ]
 
 
 class EventType(StrEnum):
-    """The closed set of event types for Milestone 1."""
+    """The closed set of event types."""
 
     EXECUTION_STARTED = "ExecutionStarted"
     EXECUTION_COMPLETED = "ExecutionCompleted"
     EXECUTION_FAILED = "ExecutionFailed"
+    EXECUTION_CANCELLED = "ExecutionCancelled"
     TOOL_REQUESTED = "ToolRequested"
     TOOL_STARTED = "ToolStarted"
     TOOL_COMPLETED = "ToolCompleted"
     TOOL_FAILED = "ToolFailed"
+    TOOL_CANCELLED = "ToolCancelled"
 
 
 EVENT_TYPES: frozenset[EventType] = frozenset(EventType)
 
+#: Tool events that leave a call open: the journal does not say what happened.
+INCOMPLETE_EVENT_TYPES: frozenset[EventType] = frozenset(
+    {EventType.TOOL_REQUESTED, EventType.TOOL_STARTED}
+)
+
+#: Events that close a call or an execution. Reaching one means the history
+#: recorded an outcome, so recovery has nothing left to resolve.
+TERMINAL_EVENT_TYPES: frozenset[EventType] = frozenset(
+    {
+        EventType.TOOL_COMPLETED,
+        EventType.TOOL_FAILED,
+        EventType.TOOL_CANCELLED,
+        EventType.EXECUTION_COMPLETED,
+        EventType.EXECUTION_FAILED,
+        EventType.EXECUTION_CANCELLED,
+    }
+)
+
 _READ_ONLY: Mapping[str, Any] = MappingProxyType({})
+
+
+def is_incomplete_event(event_type: EventType | str) -> bool:
+    """True for events that start work without recording its outcome."""
+    return EventType(event_type) in INCOMPLETE_EVENT_TYPES
+
+
+def is_terminal_event(event_type: EventType | str) -> bool:
+    """True for events that record a final outcome."""
+    return EventType(event_type) in TERMINAL_EVENT_TYPES
 
 
 def new_id(prefix: str) -> str:

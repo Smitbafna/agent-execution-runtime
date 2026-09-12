@@ -3,17 +3,24 @@
     runtime = Runtime("agent.db")
     execution = runtime.start(goal="Perform some calculations")
     execution.call("add", a=2, b=3)
+    execution.checkpoint()
     execution.complete()
+
+After a crash, the same database plus :meth:`Runtime.resume` gives an execution
+back, starting from its latest checkpoint instead of from the first event.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable, Iterable
 
+from .checkpoints import Checkpoint, CheckpointStore
 from .events import Event, EventType, new_id
 from .execution import Execution
-from .exceptions import ExecutionExistsError, ExecutionNotFoundError
+from .exceptions import ExecutionExistsError
 from .journal import EventJournal
+from .replay import ReplayEngine, ReplayResult, ReplayStep
+from .recovery import RecoveryInfo, recover_execution
 from .state import ExecutionState, reconstruct_state
 from .storage import DbPath, SQLiteStore
 from .tools import Tool, ToolRegistry
@@ -22,7 +29,7 @@ __all__ = ["Runtime"]
 
 
 class Runtime:
-    """Owns the SQLite store, the event journal and the tool registry."""
+    """Owns the SQLite store, the event journal, the checkpoints and the tools."""
 
     def __init__(
         self,
@@ -30,10 +37,23 @@ class Runtime:
         *,
         tools: Iterable[Tool | Callable[..., Any]] | None = None,
         register_default_tools: bool = True,
+        auto_checkpoint: bool = False,
     ) -> None:
+        """
+        Args:
+            db_path: SQLite file to run against.
+            tools: extra tools to register up front.
+            register_default_tools: register the built-in arithmetic tools.
+            auto_checkpoint: also snapshot the state at every lifecycle boundary
+                (``complete``, ``fail``, ``mark_cancelled``, recovery
+                resolutions). Off by default: milestones call
+                :meth:`Execution.checkpoint` where they want a snapshot.
+        """
         self.store = SQLiteStore(db_path)
         self.journal = EventJournal(self.store)
+        self.checkpoints = CheckpointStore(self.store)
         self.registry = ToolRegistry(tools, register_defaults=register_default_tools)
+        self.auto_checkpoint = auto_checkpoint
 
     # -- tools ---------------------------------------------------------------
 
@@ -71,34 +91,137 @@ class Runtime:
         self.journal.append_event(
             execution_id, EventType.EXECUTION_STARTED, {"goal": goal}
         )
-        return Execution(self.journal, self.registry, execution_id)
+        return self._execution(execution_id)
 
     def resume(self, execution_id: str) -> Execution:
-        """Rebuild an execution from its journal.
+        """Rebuild an execution from its latest checkpoint and the events after it.
 
-        Loads the events from SQLite and reconstructs the state; the returned
-        object reads its state from the journal the same way a fresh execution
-        does. Unfinished tool calls are *not* automatically continued in
-        Milestone 1.
+        With a checkpoint the state is read from the snapshot plus only the
+        journal tail; without one the whole journal is folded, exactly as in
+        Milestone 1. Either way the returned object's state is already loaded, so
+        reading it does not replay the history again.
+
+        The resumed execution reports ``RECOVERY_REQUIRED`` when the journal ends
+        with a tool call that was started but never resolved. That is a statement
+        about ambiguity, not an invitation to retry: nothing is re-run. Use
+        :meth:`Execution.recovery_info` to see what is unresolved and
+        :meth:`Execution.resolve_recovery` to decide what happens to it.
         """
-        if not self.journal.has_execution(execution_id):
-            raise ExecutionNotFoundError(f"No journal found for execution {execution_id!r}")
-        execution = Execution(self.journal, self.registry, execution_id)
-        # Touch the state so reconstruction problems surface here, not later.
-        execution.reconstruct_state()
-        return execution
+        info = self.recovery_info(execution_id)
+        return self._execution(execution_id, recovered_state=info.state)
 
     def get_events(self, execution_id: str) -> list[Event]:
         """Raw, sequence-ordered event history for an execution."""
         return self.journal.get_events(execution_id)
 
     def reconstruct_state(self, execution_id: str) -> ExecutionState:
-        """Fold an execution's events into its current state."""
+        """Fold an execution's *entire* journal into its state.
+
+        This is the ground truth a checkpointed recovery is checked against; see
+        :meth:`recover_state` for the checkpoint-accelerated version.
+        """
         return reconstruct_state(self.journal.get_events(execution_id))
+
+    def recover_state(self, execution_id: str) -> ExecutionState:
+        """The current state, from the latest checkpoint plus the events after it."""
+        return self.recovery_info(execution_id).state
+
+    def recovery_info(self, execution_id: str) -> RecoveryInfo:
+        """What recovery makes of an execution: its state, source and open calls."""
+        return recover_execution(self.journal, self.checkpoints, execution_id)
+
+    def get_checkpoints(self, execution_id: str) -> list[Checkpoint]:
+        """Every stored checkpoint of an execution, oldest first."""
+        return self.checkpoints.list_for(execution_id)
+
+    def latest_checkpoint(self, execution_id: str) -> Checkpoint | None:
+        """The newest stored checkpoint of an execution, if it has one."""
+        return self.checkpoints.get_latest(execution_id)
 
     def list_executions(self) -> list[str]:
         """Every execution id present in the journal."""
         return self.journal.list_execution_ids()
+
+    # -- replay --------------------------------------------------------------
+
+    def replay(
+        self,
+        execution_id: str,
+        *,
+        from_sequence: int = 0,
+        on_step: Callable[[ReplayStep], None] | None = None,
+    ) -> ReplayResult:
+        """Replay an execution from its journal, running no tools.
+
+        The replay re-executes the runtime's own logic -- the same
+        :meth:`Execution.call` path, the same reducers -- but every tool call is
+        answered from the recorded history instead of being executed, so a
+        ``create_github_issue`` or a ``send_email`` cannot happen twice.
+
+            result = runtime.replay(execution_id)
+            result.matched          # True: the replay agreed with the original
+            result.final_state      # == runtime.reconstruct_state(execution_id)
+
+        Args:
+            execution_id: The execution to replay.
+            from_sequence: Replay only what came after this sequence, starting
+                from the state the history has at that point (a stored checkpoint
+                if there is one). ``0`` replays the whole execution.
+
+        Returns:
+            A :class:`~agent_runtime.replay.ReplayResult` with the replayed state,
+            how much was replayed, and whether it matched.
+
+        Raises:
+            ExecutionNotFoundError: the execution has no events.
+            ReplayMismatchError: the replay diverged from the recorded history,
+                or the replayed state differs from the original. The exception
+                names the sequence and shows both sides -- a mismatch is never
+                reported as a bare ``False``.
+
+        Replay is read-only: the original journal is not modified.
+        """
+        return self.replay_engine(
+            execution_id, from_sequence=from_sequence, on_step=on_step
+        ).run()
+
+    def replay_engine(
+        self,
+        execution_id: str,
+        *,
+        from_sequence: int = 0,
+        on_step: Callable[[ReplayStep], None] | None = None,
+    ) -> ReplayEngine:
+        """The :class:`~agent_runtime.replay.ReplayEngine` for an execution.
+
+        Use this when you want to drive the replay yourself -- inspect
+        ``engine.replay_execution.steps``, replay calls one at a time -- instead
+        of taking the single :class:`~agent_runtime.replay.ReplayResult`.
+
+        ``on_step`` is called with each :class:`~agent_runtime.replay.ReplayStep`
+        as it is served, which is how the CLI prints progress while the replay runs.
+        """
+        return ReplayEngine(
+            self.journal,
+            self.checkpoints,
+            execution_id,
+            from_sequence=from_sequence,
+            on_step=on_step,
+        )
+
+    # -- internals -----------------------------------------------------------
+
+    def _execution(
+        self, execution_id: str, *, recovered_state: ExecutionState | None = None
+    ) -> Execution:
+        return Execution(
+            self.journal,
+            self.registry,
+            execution_id,
+            checkpoints=self.checkpoints,
+            recovered_state=recovered_state,
+            auto_checkpoint=self.auto_checkpoint,
+        )
 
     # -- lifecycle -----------------------------------------------------------
 

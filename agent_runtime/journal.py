@@ -70,6 +70,18 @@ class EventJournal:
         )
         return [self._row_to_event(row) for row in rows]
 
+    def get_events_from(self, execution_id: str, after_sequence: int) -> list[Event]:
+        """Events strictly after ``after_sequence``, ordered by sequence.
+
+        This is what makes a checkpoint worth having: recovery reads the snapshot
+        plus only the tail of the journal instead of the whole history.
+        """
+        rows = self.store.query_all(
+            "SELECT * FROM events WHERE execution_id = ? AND sequence > ? ORDER BY sequence ASC",
+            (execution_id, after_sequence),
+        )
+        return [self._row_to_event(row) for row in rows]
+
     def get_event(self, execution_id: str, sequence: int) -> Event:
         """A single event by execution id and sequence."""
         rows = self.store.query_all(
@@ -85,6 +97,18 @@ class EventJournal:
     def get_last_sequence(self, execution_id: str) -> int:
         """Highest sequence for an execution, or ``0`` when it has no events."""
         return self._last_sequence(self.store.connection, execution_id)
+
+    def get_last_event(self, execution_id: str) -> Event | None:
+        """The most recent event of an execution, or ``None`` when it has none.
+
+        The sequence a checkpoint must name: a snapshot is only ever valid for
+        the execution's latest persisted event.
+        """
+        rows = self.store.query_all(
+            "SELECT * FROM events WHERE execution_id = ? ORDER BY sequence DESC LIMIT 1",
+            (execution_id,),
+        )
+        return self._row_to_event(rows[0]) if rows else None
 
     def count_events(self, execution_id: str) -> int:
         row = self.store.query_all(

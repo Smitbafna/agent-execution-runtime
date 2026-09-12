@@ -6,6 +6,9 @@ callers can catch a single base class.
 
 from __future__ import annotations
 
+import json
+from typing import Any, Mapping
+
 __all__ = [
     "AgentRuntimeError",
     "StorageError",
@@ -13,6 +16,9 @@ __all__ = [
     "SequenceError",
     "DuplicateSequenceError",
     "EventNotFoundError",
+    "CheckpointError",
+    "InconsistentCheckpointError",
+    "CorruptCheckpointError",
     "ExecutionError",
     "ExecutionExistsError",
     "ExecutionNotFoundError",
@@ -23,7 +29,11 @@ __all__ = [
     "ToolCallError",
     "ToolArgumentError",
     "ToolInvocationError",
+    "UnknownToolCallError",
+    "InvalidRecoveryActionError",
     "StateReconstructionError",
+    "ReplayError",
+    "ReplayMismatchError",
 ]
 
 
@@ -49,6 +59,29 @@ class DuplicateSequenceError(SequenceError):
 
 class EventNotFoundError(JournalError):
     """A requested event does not exist in the journal."""
+
+
+class CheckpointError(AgentRuntimeError):
+    """Base class for checkpoint failures."""
+
+
+class InconsistentCheckpointError(CheckpointError):
+    """A checkpoint would not describe the state the journal actually holds.
+
+    Raised instead of writing, for example, when the sequence a caller wants to
+    store is ahead of or behind the execution's latest event, or when the event
+    at that sequence does not exist at all. Either way the snapshot would be a
+    state the history does not support, so nothing is persisted.
+    """
+
+
+class CorruptCheckpointError(CheckpointError):
+    """A stored checkpoint cannot be read back as an execution state.
+
+    Recovery refuses to guess here: an unreadable checkpoint is surfaced, not
+    silently skipped, because quietly falling back to a full replay would hide
+    the fact that stored data is broken.
+    """
 
 
 class ExecutionError(AgentRuntimeError):
@@ -110,5 +143,143 @@ class ToolInvocationError(ToolCallError):
     """
 
 
+class UnknownToolCallError(AgentRuntimeError):
+    """No tool call with the requested id exists in this execution's history."""
+
+
+class InvalidRecoveryActionError(AgentRuntimeError):
+    """An unsupported recovery action was requested.
+
+    Milestone 2 records decisions the application has already made; it does not
+    retry anything on its own.
+    """
+
+
 class StateReconstructionError(AgentRuntimeError):
     """An event could not be applied while rebuilding execution state."""
+
+
+class ReplayError(AgentRuntimeError):
+    """Base class for deterministic replay failures.
+
+    Milestone 3 replays a *finished* history against itself. Anything that stops
+    that -- a divergence between the recorded call and the replayed one, or a
+    start point the history cannot support -- is raised rather than smoothed over.
+    """
+
+
+class ReplayMismatchError(ReplayError):
+    """A replay diverged from the recorded history.
+
+    Raised the moment replay and the journal disagree: a different tool, different
+    arguments, a call with no recorded counterpart (or vice versa), or a final
+    state that is not the one the original execution reached.
+
+    The exception carries the machine-readable fields (:attr:`kind`,
+    :attr:`sequence`, :attr:`expected`, :attr:`received`) *and* renders the
+    human-readable report::
+
+        ReplayMismatchError
+
+        Execution: exec_123
+        Sequence: 7
+
+        Expected:
+            tool: search_code
+            args: {"query": "authentication"}
+
+        Received:
+            tool: search_code
+            args: {"query": "database"}
+
+    Attributes:
+        kind: Stable, matchable label for the divergence (``tool``,
+            ``arguments``, ``sequence``, ``missing_recorded_call``,
+            ``unexpected_tool_call``, ``unresolved_tool_call``, ``state``,
+            ``lifecycle``).
+        execution_id: The execution being replayed.
+        sequence: The event sequence the divergence was detected at, when known.
+        expected: What the journal recorded.
+        received: What the replay produced.
+        original_state / replayed_state: Present for a ``state`` divergence.
+    """
+
+    def __init__(
+        self,
+        summary: str,
+        *,
+        kind: str,
+        execution_id: str,
+        sequence: int | None = None,
+        expected: Any = None,
+        received: Any = None,
+        original_state: Any = None,
+        replayed_state: Any = None,
+    ) -> None:
+        super().__init__(summary)
+        self.kind = kind
+        self.execution_id = execution_id
+        self.sequence = sequence
+        self.expected = expected
+        self.received = received
+        self.original_state = original_state
+        self.replayed_state = replayed_state
+
+    def __str__(self) -> str:
+        lines = [
+            "ReplayMismatchError",
+            "",
+            f"Reason: {self.args[0]}",
+            f"Execution: {self.execution_id}",
+        ]
+        if self.sequence is not None:
+            lines.append(f"Sequence: {self.sequence}")
+
+        expected = _render(self.expected)
+        received = _render(self.received)
+        if expected or received:
+            lines.append("")
+            lines.append("Expected:")
+            lines.extend(f"    {line}" for line in expected)
+            lines.append("")
+            lines.append("Received:")
+            lines.extend(f"    {line}" for line in received)
+
+        if self.original_state is not None or self.replayed_state is not None:
+            lines.append("")
+            lines.append("Original state:")
+            lines.extend(f"    {line}" for line in _render_state(self.original_state))
+            lines.append("")
+            lines.append("Replayed state:")
+            lines.extend(f"    {line}" for line in _render_state(self.replayed_state))
+        return "\n".join(lines)
+
+
+def _render(value: Any) -> list[str]:
+    """Format an expected/received payload as indented ``label: json`` lines."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [f"{key}: {_json(value[key])}" for key in value]
+    return [_json(value)]
+
+
+def _render_state(state: Any) -> list[str]:
+    """Summarize an :class:`~agent_runtime.state.ExecutionState` for a report."""
+    if state is None:
+        return []
+    return [
+        f"status = {getattr(state, 'status', '?')}",
+        f"tool_calls = {len(getattr(state, 'tool_calls', ()))}",
+        f"last_sequence = {getattr(state, 'last_sequence', '?')}",
+    ]
+
+
+def _json(value: Any) -> str:
+    """Render a payload as JSON, falling back to ``repr`` if it is not JSON-safe."""
+    try:
+        return json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):  # pragma: no cover - payloads are JSON-safe
+        return repr(value)

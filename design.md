@@ -1,0 +1,26 @@
+## Milestone 3 design decisions worth your review
+
+1. **Replay re-runs the runtime rather than loading a stored answer.** A `ReplayExecution` is a real `Execution` over an in-memory journal and a REPLAY tool runner, so the same `Execution.call` path and the same reducers run again. The replayed state is therefore *derived* — which is the only way a divergence is detectable at all. A replay that merely re-read the checkpointed state could not tell a matching run from a wrong one.
+2. **`Execution.call` now dispatches through a `ToolRunner`.** That was a small refactor of a Milestone 1 hot path, and it is what makes the guarantee structural: the REPLAY runner overrides the single method that would invoke a function, so there is no branch anywhere that can reach a tool during replay. `ReplayToolRunner.registry` is `None` on purpose — holding a registry would be the only way to accidentally run something.
+3. **The replay journal mirrors the recorded events' `event_id` and `timestamp`.** Everything else — event type and payload — is produced by the re-running code. Mirroring identity is what makes `ToolCall.started_at` (taken from the event timestamp) line up, and it is why `replayed.state == original.state` holds field for field rather than only in shape. A replay that invented fresh timestamps would need that field excluded from comparison, which would weaken the check.
+4. **A replayed call reuses its recorded `call_id`**, via a `_new_call_id` seam on `Execution`. Same reason as (3): identity is part of the state being compared.
+5. **Replay validates *before* journalling.** The first version matched the request inside the runner, i.e. after `ToolRequested`/`ToolStarted` had been written, so a mismatch left a half-written tool call and an execution stuck in `RECOVERY_REQUIRED`. `ReplayExecution.call` now pre-checks with `ReplayToolRunner.check()`, mirroring the NORMAL path, which also validates arguments before writing anything.
+6. **A call the journal never settled is replayed as unsettled, not invented.** `ToolRequested`/`ToolStarted` are re-emitted, no outcome is made up, and the replay ends in `RECOVERY_REQUIRED` — the same status the original had. Inventing a result would be the one thing replay must never do.
+7. **A start point with an unresolved call is refused outright.** Replaying from mid-call would mean resolving a `ToolCompleted` whose `ToolRequested` is behind the start point. That is Milestone 2's "the journal does not say, so do not guess" applied to a start point, so it raises `ReplayMismatchError(kind="sequence")` rather than a confusing `StateReconstructionError` from deep inside the reducers.
+8. **`ReplayMismatchError` always raises; `matched` is informational.** The spec asked not to return a bare `False`, so `run()` raises on divergence and the returned `ReplayResult.matched` is the post-condition check. `ReplayMismatchError.kind` is a stable string (`tool_name`, `arguments`, `sequence`, `unexpected_tool_call`, …) so callers can branch without parsing the message.
+9. **`__init__.py` had a duplicated import block** (two `from .exceptions import ...` statements listing overlapping names). Left as-is rather than tidied, to keep the diff about Milestone 3 — worth a cleanup pass.
+10. **No global interception of `time`/`random`/`uuid`.** Deliberate, per the milestone. Replay substitutes recorded *tool outputs*; anything else that varies is an external input the execution should expose as a tool. The determinism tests demonstrate this by using tools that read the clock, the RNG, `uuid` and `os.environ` directly and then replaying them successfully.
+
+## Milestone 2 design decisions worth your review
+
+1. **`Execution.state` is now cached** (invalidated on every write). Milestone 1 rebuilt it on each access. The cache is what makes §2's "state + sequence atomically" achievable — a rebuild mid-checkpoint could snapshot a state whose sequence had moved on. `checkpoint()` additionally re-reads and rebuilds if the DB moved, and `create()` re-validates in-transaction anyway.
+2. **`RECOVERY_REQUIRED` is never persisted.** A checkpoint stores `RUNNING`; recovery re-derives the diagnosis from events. Otherwise two sources would own one field.
+3. **Added `ExecutionCancelled`/`ToolCancelled` events.** `CANCELLED` is in the required status list but needed a journal event, otherwise the status would be a value the journal can't produce.
+4. **A corrupt checkpoint raises instead of falling back** to a full replay — falling back would hide broken stored data behind a working recovery.
+
+## Also
+
+- `tests/test_replay.py` (59 tests) covers completed/interrupted executions, failed tools, checkpoint vs. full replay equivalence, every mismatch kind, determinism, and the CLI.
+- A counter-based tool (`dangerous()`) plus the six side-effect tools the milestone names (`create_file`, `delete_file`, `send_email`, `create_github_issue`, `database_write`, `http_post`) all assert the real function runs exactly once across original + replay.
+- `agent-runtime replay <id>` is a new CLI (`agent_runtime/cli.py`, wired up as a console script). Exit codes: `0` matched, `1` mismatch, `2` other runtime error.
+- **Note:** `__pycache__/*.pyc` files are tracked in git in this repo. I left that alone, but you'll want a `.gitignore` and `git rm -r --cached` at some point.

@@ -94,19 +94,22 @@ def test_append_rejects_non_positive_sequence(journal):
 
 
 def test_database_prevents_duplicate_sequences(journal):
-    journal.append_event("exec_1", EventType.EXECUTION_STARTED, {"goal": "g"})
+    event = journal.append_event("exec_1", EventType.EXECUTION_STARTED, {"goal": "g"})
 
     # Bypass the journal API to prove the UNIQUE constraint also protects us.
     with pytest.raises(sqlite3.IntegrityError):
         journal.store.execute(
             "INSERT INTO events (event_id, execution_id, sequence, event_type, payload, timestamp)"
-            " VALUES ('evt_dup', 'exec_1', 1, 'ExecutionStarted', '{}', 'now')"
+            " VALUES ('evt_other', 'exec_1', 1, 'ExecutionStarted', '{}', 'now')"
         )
 
+    # ... and the primary key rejects a reused event id at an otherwise free
+    # sequence.
     with pytest.raises(sqlite3.IntegrityError):
         journal.store.execute(
             "INSERT INTO events (event_id, execution_id, sequence, event_type, payload, timestamp)"
-            " VALUES ('evt_dup', 'exec_1', 2, 'ExecutionStarted', '{}', 'now')"
+            " VALUES (?, 'exec_1', 2, 'ExecutionStarted', '{}', 'now')",
+            (event.event_id,),
         )
 
 

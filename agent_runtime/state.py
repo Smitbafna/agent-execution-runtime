@@ -3,7 +3,17 @@
 Nothing in here keeps state between calls: :func:`reconstruct_state` folds the
 ordered event stream through :func:`apply_event` and returns the result. The
 runtime treats the journal as the source of truth and derives every read from
-it.
+it -- which is also what makes a checkpoint safe, because a checkpoint is just
+this same value captured at one sequence.
+
+Milestone 2 adds the two things recovery needs in order to be honest:
+
+* the sequence each tool call was last seen at, so an unfinished call can be
+  reported with the event it stopped at (:func:`detect_incomplete_tools`);
+* the statuses a reconstructed history can be *in* rather than only one it
+  decided on -- ``CANCELLED`` for a deliberate stop, and
+  ``RECOVERY_REQUIRED`` when the journal ends with work still open
+  (:func:`resolve_status`).
 """
 
 from __future__ import annotations
@@ -19,10 +29,17 @@ __all__ = [
     "ExecutionStatus",
     "ToolCallStatus",
     "ToolCall",
+    "IncompleteTool",
     "ExecutionState",
+    "TERMINAL_STATUSES",
+    "INCOMPLETE_TOOL_STATUSES",
     "initial_state",
     "apply_event",
     "reconstruct_state",
+    "detect_incomplete_tools",
+    "resolve_status",
+    "finalize_state",
+    "replace_state",
 ]
 
 
@@ -30,6 +47,15 @@ class ExecutionStatus(StrEnum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    #: The journal ends with tool work that has no recorded outcome. The
+    #: ambiguity is surfaced instead of guessed at -- nothing is retried.
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True when the history recorded a final outcome for the execution."""
+        return self in TERMINAL_STATUSES
 
 
 class ToolCallStatus(StrEnum):
@@ -37,11 +63,38 @@ class ToolCallStatus(StrEnum):
     STARTED = "STARTED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+    @property
+    def is_incomplete(self) -> bool:
+        """True while the journal still says nothing about the outcome."""
+        return self in INCOMPLETE_TOOL_STATUSES
+
+
+#: Statuses that mean the execution has finished, one way or another.
+TERMINAL_STATUSES: frozenset[ExecutionStatus] = frozenset(
+    {
+        ExecutionStatus.COMPLETED,
+        ExecutionStatus.FAILED,
+        ExecutionStatus.CANCELLED,
+    }
+)
+
+#: Tool call statuses that leave the call open for recovery to resolve.
+INCOMPLETE_TOOL_STATUSES: frozenset[ToolCallStatus] = frozenset(
+    {ToolCallStatus.REQUESTED, ToolCallStatus.STARTED}
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
-    """One tool call, as reconstructed from its events."""
+    """One tool call, as reconstructed from its events.
+
+    The ``*_sequence`` fields record *where in the journal* each phase of the
+    call was last seen. They are what lets recovery name the event an
+    unfinished call stopped at, and they make a stored state verifiable
+    against its events.
+    """
 
     call_id: str
     tool: str
@@ -49,6 +102,10 @@ class ToolCall:
     status: ToolCallStatus = ToolCallStatus.REQUESTED
     result: Any = None
     error: Mapping[str, Any] | None = None
+    requested_sequence: int = 0
+    started_sequence: int = 0
+    completed_sequence: int = 0
+    started_at: str | None = None
 
     def __str__(self) -> str:
         args = ", ".join(f"{k}={v!r}" for k, v in self.arguments.items())
@@ -57,12 +114,124 @@ class ToolCall:
         if self.status is ToolCallStatus.FAILED:
             message = (self.error or {}).get("message", "failed")
             return f"{self.tool}({args}) !! {message}"
+        if self.status is ToolCallStatus.CANCELLED:
+            return f"{self.tool}({args}) -- cancelled"
         return f"{self.tool}({args}) [{self.status}]"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "call_id": self.call_id,
+            "tool": self.tool,
+            "arguments": dict(self.arguments),
+            "status": str(self.status),
+            "result": self.result,
+            "error": self.error,
+            "requested_sequence": self.requested_sequence,
+            "started_sequence": self.started_sequence,
+            "completed_sequence": self.completed_sequence,
+            "started_at": self.started_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ToolCall":
+        return cls(
+            call_id=data["call_id"],
+            tool=data["tool"],
+            arguments=data.get("arguments") or {},
+            status=ToolCallStatus(data.get("status") or ToolCallStatus.REQUESTED),
+            result=data.get("result"),
+            error=data.get("error"),
+            requested_sequence=int(data.get("requested_sequence") or 0),
+            started_sequence=int(data.get("started_sequence") or 0),
+            completed_sequence=int(data.get("completed_sequence") or 0),
+            started_at=data.get("started_at"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class IncompleteTool:
+    """A tool call the journal never recorded an outcome for.
+
+    Produced by :func:`detect_incomplete_tools` after recovery::
+
+        unfinished_tool:
+            name: run_tests
+            sequence: 17
+            status: STARTED
+    """
+
+    call_id: str
+    tool: str
+    status: ToolCallStatus
+    sequence: int
+    arguments: Mapping[str, Any]
+    requested_sequence: int = 0
+    started_sequence: int = 0
+    started_at: str | None = None
+
+    @classmethod
+    def from_call(cls, call: ToolCall) -> "IncompleteTool":
+        """Describe an open tool call, pointing at the event recovery found it at."""
+        return cls(
+            call_id=call.call_id,
+            tool=call.tool,
+            status=call.status,
+            # A started call is reported at the sequence it started at; a call
+            # that never got that far is reported at its request.
+            sequence=(
+                call.started_sequence
+                if call.status is ToolCallStatus.STARTED
+                else call.requested_sequence
+            ),
+            arguments=dict(call.arguments),
+            requested_sequence=call.requested_sequence,
+            started_sequence=call.started_sequence,
+            started_at=call.started_at,
+        )
+
+    @property
+    def was_started(self) -> bool:
+        """True when the tool actually began running before the process died."""
+        return self.status is ToolCallStatus.STARTED
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "call_id": self.call_id,
+            "tool": self.tool,
+            "status": str(self.status),
+            "sequence": self.sequence,
+            "arguments": dict(self.arguments),
+            "requested_sequence": self.requested_sequence,
+            "started_sequence": self.started_sequence,
+            "started_at": self.started_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "IncompleteTool":
+        return cls(
+            call_id=data["call_id"],
+            tool=data["tool"],
+            status=ToolCallStatus(data.get("status") or ToolCallStatus.REQUESTED),
+            sequence=int(data.get("sequence") or 0),
+            arguments=data.get("arguments") or {},
+            requested_sequence=int(data.get("requested_sequence") or 0),
+            started_sequence=int(data.get("started_sequence") or 0),
+            started_at=data.get("started_at"),
+        )
+
+    def __str__(self) -> str:
+        args = ", ".join(f"{k}={v!r}" for k, v in self.arguments.items())
+        return f"{self.tool}({args})"
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutionState:
-    """The full state of an execution at a point in its event history."""
+    """The full state of an execution at a point in its event history.
+
+    The whole object is JSON-serializable (:meth:`to_dict`) and round-trips
+    exactly (:meth:`from_dict`). That is what lets it be stored as a checkpoint
+    and compared against a fresh reconstruction of the same events.
+    """
 
     execution_id: str = ""
     status: ExecutionStatus = ExecutionStatus.RUNNING
@@ -71,11 +240,58 @@ class ExecutionState:
     last_sequence: int = 0
     result: Any = None
     error: Mapping[str, Any] | None = None
+    incomplete_tools: tuple[IncompleteTool, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "status": str(self.status),
+            "goal": self.goal,
+            "last_sequence": self.last_sequence,
+            "result": self.result,
+            "error": self.error,
+            "tool_calls": [call.to_dict() for call in self.tool_calls],
+            "incomplete_tools": [item.to_dict() for item in self.incomplete_tools],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionState":
+        """Rebuild a state from :meth:`to_dict` output.
+
+        Malformed input raises ``KeyError``/``ValueError``/``TypeError``; the
+        checkpoint layer turns those into
+        :class:`~agent_runtime.exceptions.CorruptCheckpointError`.
+        """
+        return cls(
+            execution_id=data["execution_id"],
+            status=ExecutionStatus(data["status"]),
+            goal=data.get("goal"),
+            last_sequence=int(data.get("last_sequence") or 0),
+            result=data.get("result"),
+            error=data.get("error"),
+            tool_calls=tuple(
+                ToolCall.from_dict(item) for item in data.get("tool_calls") or ()
+            ),
+            incomplete_tools=tuple(
+                IncompleteTool.from_dict(item) for item in data.get("incomplete_tools") or ()
+            ),
+        )
 
 
 def initial_state(execution_id: str = "") -> ExecutionState:
     """The state of an execution that has produced no events yet."""
     return ExecutionState(execution_id=execution_id, status=ExecutionStatus.RUNNING)
+
+
+def replace_state(
+    state: ExecutionState, /, **changes: Any
+) -> ExecutionState:
+    """Copy ``state`` with ``changes`` applied.
+
+    A thin, re-exported :func:`dataclasses.replace` so callers (tests, checkpoint
+    validation) can adjust a single field without importing ``dataclasses``.
+    """
+    return replace(state, **changes)
 
 
 
@@ -128,29 +344,63 @@ def _on_execution_failed(state: ExecutionState, event: Event) -> ExecutionState:
     )
 
 
+def _on_execution_cancelled(state: ExecutionState, event: Event) -> ExecutionState:
+    return replace(
+        state,
+        execution_id=event.execution_id,
+        status=ExecutionStatus.CANCELLED,
+        result=event.payload.get("result"),
+    )
+
+
 def _on_tool_requested(state: ExecutionState, event: Event) -> ExecutionState:
     call = ToolCall(
         call_id=event.payload["call_id"],
         tool=event.payload["tool"],
         arguments=event.payload.get("arguments") or {},
         status=ToolCallStatus.REQUESTED,
+        requested_sequence=event.sequence,
     )
     return replace(state, execution_id=event.execution_id, tool_calls=state.tool_calls + (call,))
 
 
 def _on_tool_started(state: ExecutionState, event: Event) -> ExecutionState:
-    return _update_call(state, event, status=ToolCallStatus.STARTED)
+    return _update_call(
+        state,
+        event,
+        status=ToolCallStatus.STARTED,
+        started_sequence=event.sequence,
+        started_at=event.timestamp,
+    )
 
 
 def _on_tool_completed(state: ExecutionState, event: Event) -> ExecutionState:
     return _update_call(
-        state, event, status=ToolCallStatus.COMPLETED, result=event.payload.get("result")
+        state,
+        event,
+        status=ToolCallStatus.COMPLETED,
+        result=event.payload.get("result"),
+        completed_sequence=event.sequence,
     )
 
 
 def _on_tool_failed(state: ExecutionState, event: Event) -> ExecutionState:
     return _update_call(
-        state, event, status=ToolCallStatus.FAILED, error=event.payload.get("error") or {}
+        state,
+        event,
+        status=ToolCallStatus.FAILED,
+        error=event.payload.get("error") or {},
+        completed_sequence=event.sequence,
+    )
+
+
+def _on_tool_cancelled(state: ExecutionState, event: Event) -> ExecutionState:
+    return _update_call(
+        state,
+        event,
+        status=ToolCallStatus.CANCELLED,
+        error=event.payload.get("error") or {},
+        completed_sequence=event.sequence,
     )
 
 
@@ -171,20 +421,65 @@ _REDUCERS: dict[EventType, Any] = {
     EventType.EXECUTION_STARTED: _on_execution_started,
     EventType.EXECUTION_COMPLETED: _on_execution_completed,
     EventType.EXECUTION_FAILED: _on_execution_failed,
+    EventType.EXECUTION_CANCELLED: _on_execution_cancelled,
     EventType.TOOL_REQUESTED: _on_tool_requested,
     EventType.TOOL_STARTED: _on_tool_started,
     EventType.TOOL_COMPLETED: _on_tool_completed,
     EventType.TOOL_FAILED: _on_tool_failed,
+    EventType.TOOL_CANCELLED: _on_tool_cancelled,
 }
+
+
+def detect_incomplete_tools(state: ExecutionState) -> tuple[IncompleteTool, ...]:
+    """The tool calls the journal left open.
+
+    A call is open while the events say it was requested or started and never
+    say what became of it -- exactly the shape a crash leaves behind::
+
+        ToolRequested -> ToolStarted -> (process dies)
+    """
+    return tuple(
+        IncompleteTool.from_call(call)
+        for call in state.tool_calls
+        if call.status.is_incomplete
+    )
+
+
+def resolve_status(state: ExecutionState) -> ExecutionStatus:
+    """The status a history leaves an execution in.
+
+    A ``RUNNING`` execution with open tool calls becomes ``RECOVERY_REQUIRED``:
+    the journal cannot say whether the tool finished, so the runtime refuses to
+    guess and lets the application decide.
+
+    Any other status is returned untouched. ``COMPLETED``, ``FAILED`` and
+    ``CANCELLED`` were deliberate decisions that were journalled, and they
+    remain the answer even if some tool call in the same history never settled.
+    """
+    if state.status is ExecutionStatus.RUNNING and detect_incomplete_tools(state):
+        return ExecutionStatus.RECOVERY_REQUIRED
+    return state.status
+
+
+def finalize_state(state: ExecutionState) -> ExecutionState:
+    """Add everything a state derives from its events rather than from events.
+
+    Fills in :attr:`ExecutionState.incomplete_tools` and settles the status, so
+    every caller sees the same view. It is idempotent, which is what makes it
+    safe to run over a checkpointed state that then has more events applied.
+    """
+    pending = detect_incomplete_tools(state)
+    return replace(state, incomplete_tools=pending, status=resolve_status(state))
 
 
 def reconstruct_state(events: Iterable[Event]) -> ExecutionState:
     """Fold an event stream into the state it describes.
 
     ``events`` must be ordered by sequence (as returned by
-    :meth:`EventJournal.get_events`).
+    :meth:`EventJournal.get_events`). The result is finalized, so it already
+    carries the incomplete tool calls and the recovery status the stream implies.
     """
     state = initial_state()
     for event in events:
         state = apply_event(state, event)
-    return state
+    return finalize_state(state)
