@@ -5,6 +5,22 @@ what a crash left unfinished -- is derived from the journal by folding its event
 through the reducers in :mod:`agent_runtime.state`. In-memory bookkeeping is
 never a second source of truth, and a checkpoint is nothing more than one of
 those derived states captured at a sequence.
+
+Milestone 4A adds the attempt loop to that story. :meth:`Execution.call` makes
+*one logical call* -- one ``call_id`` -- and the loop inside it runs the
+attempts::
+
+    ToolRequested
+    ToolStarted     attempt=1
+    ToolFailed      attempt=1
+    ToolRetryScheduled attempt=2
+    ToolStarted     attempt=2
+    ToolCompleted   attempt=2
+
+The decision to make another attempt is journalled before the wait and before
+the attempt, so a process that dies during the backoff leaves the scheduled
+retry in the journal rather than only in the memory of a process that was about
+to sleep.
 """
 
 from __future__ import annotations
@@ -20,15 +36,24 @@ from .exceptions import (
 )
 from .journal import EventJournal
 from .recovery import RecoveryInfo, recover_execution
+from .retry import (
+    NO_RETRY,
+    RealSleeper,
+    RetryDecision,
+    RetryPolicy,
+    Sleeper,
+)
 from .runner import ToolRequest, ToolRunner
 from .state import (
     ExecutionState,
     ExecutionStatus,
     IncompleteTool,
+    PendingRetry,
     ToolCall,
+    detect_pending_retries,
     reconstruct_state,
 )
-from .tools import ToolRegistry, make_jsonable
+from .tools import ToolRegistry, check_retry_policy, make_jsonable
 
 __all__ = ["Execution", "RecoveryAction"]
 
@@ -62,6 +87,7 @@ class Execution:
         recovered_state: ExecutionState | None = None,
         auto_checkpoint: bool = False,
         runner: ToolRunner | None = None,
+        sleeper: Sleeper | None = None,
     ) -> None:
         self._journal = journal
         self._registry = registry
@@ -72,8 +98,16 @@ class Execution:
         #: Carries out each ``call``. Defaults to the NORMAL runner; replay
         #: passes a REPLAY runner that serves recorded results instead.
         self._runner = runner if runner is not None else ToolRunner(registry)
+        #: How retry backoff waits. Injectable so a test can assert the
+        #: schedule without spending it -- nothing here patches ``time.sleep``.
+        self._sleeper = sleeper if sleeper is not None else RealSleeper()
 
     # -- identity / derived state --------------------------------------------
+
+    @property
+    def sleeper(self) -> Sleeper:
+        """The sleeper this execution waits through, between retry attempts."""
+        return self._sleeper
 
     @property
     def id(self) -> str:
@@ -131,6 +165,18 @@ class Execution:
     def needs_recovery(self) -> bool:
         return self.status is ExecutionStatus.RECOVERY_REQUIRED
 
+    @property
+    def pending_retries(self) -> tuple[PendingRetry, ...]:
+        """Retries the journal scheduled but had not started yet.
+
+        Unlike :attr:`incomplete_tools`, these are decisions rather than
+        ambiguities: each one names the attempt that comes next, so a resumed
+        execution can carry it on with
+        :meth:`continue_pending_retry` instead of asking the application to
+        decide what happened to work whose outcome is unknown.
+        """
+        return detect_pending_retries(self.state)
+
     def reconstruct_state(self) -> ExecutionState:
         """Explicit alias for :attr:`state` (mirrors ``reconstruct_state(events)``)."""
         return self.state
@@ -155,65 +201,237 @@ class Execution:
                     "status": str(call.status),
                     "result": call.result,
                     "error": call.error,
+                    "attempt": call.attempt,
+                    "attempts": [item.to_dict() for item in call.attempts],
+                    "pending_retry": (
+                        None if call.pending_retry is None else call.pending_retry.to_dict()
+                    ),
                 }
                 for call in state.tool_calls
             ],
             "incomplete_tools": [item.to_dict() for item in state.incomplete_tools],
+            "pending_retries": [item.to_dict() for item in detect_pending_retries(state)],
         }
 
     # -- lifecycle -----------------------------------------------------------
 
-    def call(self, name: str, *args: Any, **kwargs: Any) -> Any:
-        """Run a registered tool and journal the whole attempt.
+    def call(
+        self,
+        name: str,
+        *args: Any,
+        retry_policy: RetryPolicy | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a registered tool as one logical call, journalling every attempt.
 
-        Emits ``ToolRequested`` -> ``ToolStarted`` -> ``ToolCompleted`` on
-        success, or ``ToolRequested`` -> ``ToolStarted`` -> ``ToolFailed`` when
-        the tool raises, in which case :class:`ToolInvocationError` is raised
-        after the failure is durably recorded. Milestone 1 performs no retries.
+        Emits ``ToolRequested`` once -- the logical call, with its stable
+        ``call_id`` and the resolved retry policy -- and then one start/outcome
+        pair per attempt::
 
-        The attempt itself is handed to a :class:`~agent_runtime.runner.ToolRunner`.
-        In ``NORMAL`` mode that runs the function; replay supplies a ``REPLAY``
-        runner over a recorded history instead (see :mod:`agent_runtime.replay`),
-        so both paths journal the same way and neither can diverge from the other.
+            ToolRequested
+            ToolStarted   attempt=1 -> ToolCompleted attempt=1
 
-        A process that dies between ``ToolStarted`` and the outcome leaves an
-        open call behind; the next :meth:`Runtime.resume` reports it as
-        ``RECOVERY_REQUIRED`` instead of running the tool again.
+        or, when the failure is retryable and attempts remain::
+
+            ToolStarted          attempt=1 -> ToolFailed attempt=1
+            ToolRetryScheduled   attempt=2      (journalled before the wait)
+            ToolStarted          attempt=2 -> ToolCompleted attempt=2
+
+        The policy is resolved call-level first, then tool-level, then "no
+        retries" -- so ``execution.call("fetch_data", retry_policy=...)`` always
+        wins over the one its tool declares. Only
+        :class:`~agent_runtime.exceptions.RetryableToolError` is retried by
+        default; a permanent or an unexpected failure is recorded once and
+        raised as :class:`ToolInvocationError` after it is durably recorded.
+
+        The attempt itself is handed to a
+        :class:`~agent_runtime.runner.ToolRunner`. In ``NORMAL`` mode that runs
+        the function; replay supplies a ``REPLAY`` runner over a recorded
+        history instead (see :mod:`agent_runtime.replay`), so both paths journal
+        the same way and neither can diverge from the other.
         """
         self._require_running("call a tool")
 
         # Resolve + validate before journalling: an unknown tool or a bad
         # argument list is a programming error, and nothing was attempted.
         request = self._prepare_request(name, args, kwargs)
+        policy = self._resolve_retry_policy(name, retry_policy)
 
         call_id = self._new_call_id()
+        self._runner.begin_call(call_id, request)
         self._append(
             EventType.TOOL_REQUESTED,
-            {"call_id": call_id, "tool": request.tool, "arguments": request.arguments},
+            {
+                "call_id": call_id,
+                "tool": request.tool,
+                "arguments": request.arguments,
+                # Recorded so that the policy a call ran under -- and the
+                # backoff schedule derived from it -- can be read back long
+                # after the process that used it is gone.
+                "retry_policy": policy.to_dict(),
+            },
         )
-        self._append(EventType.TOOL_STARTED, {"call_id": call_id, "tool": request.tool})
+        return self._attempt_until_settled(request, call_id, policy, attempt=1)
 
-        outcome = self._runner.run(request)
-        if not outcome.succeeded:
+    def continue_pending_retry(self, call_id: str) -> Any:
+        """Carry on the attempt that a crash interrupted.
+
+        A process can die after ``ToolRetryScheduled`` was committed and before
+        the attempt it scheduled began. Nothing about that is ambiguous -- the
+        journal says exactly which attempt comes next -- so a resumed execution
+        can simply make it, using the policy the call was journalled with. The
+        already-scheduled backoff is *not* waited for again: it elapsed while
+        the process was gone.
+
+        Args:
+            call_id: The logical call whose scheduled attempt to run.
+
+        Returns:
+            The attempt's result.
+
+        Raises:
+            UnknownToolCallError: this execution has no such call.
+            InvalidStateTransitionError: the call has no scheduled retry, or the
+                execution has already finished.
+            ToolInvocationError: this attempt failed for good.
+        """
+        self._require_running(f"continue the retry of tool call {call_id!r}")
+        call = next((c for c in self.tool_calls if c.call_id == call_id), None)
+        if call is None:
+            raise UnknownToolCallError(
+                f"Execution {self._id!r} has no tool call {call_id!r} to retry"
+            )
+        if call.pending_retry is None:
+            raise InvalidStateTransitionError(
+                f"Cannot continue tool call {call_id!r}: the journal has no retry "
+                f"scheduled for it (it is {call.status})"
+            )
+        request = ToolRequest(tool=call.tool, arguments=dict(call.arguments))
+        self._runner.begin_call(call_id, request)
+        return self._attempt_until_settled(
+            request,
+            call_id,
+            self._policy_of_call(call_id),
+            attempt=call.pending_retry.attempt,
+        )
+
+    def _resolve_retry_policy(
+        self, name: str, call_policy: RetryPolicy | None
+    ) -> RetryPolicy:
+        """The policy this call runs under: call-level, then tool-level, then none.
+
+        The call-level policy wins outright -- it is the more specific statement
+        about this one invocation. When neither says anything, the answer is
+        :attr:`RetryPolicy.none`, so a tool call is never retried by accident.
+        """
+        if call_policy is not None:
+            return check_retry_policy(call_policy, tool_name=name) or NO_RETRY
+        if self._registry is not None:
+            declared = self._registry.get(name).retry_policy
+            if declared is not None:
+                return declared
+        return NO_RETRY
+
+    def _policy_of_call(self, call_id: str) -> RetryPolicy:
+        """The policy a past call was journalled with, read back from its request.
+
+        Used to continue a retry after a crash: the policy has to come from
+        durable data, because the object that resolved it is long gone.
+        """
+        for event in reversed(self.events):
+            if (
+                event.event_type is EventType.TOOL_REQUESTED
+                and event.payload.get("call_id") == call_id
+            ):
+                return RetryPolicy.from_dict(event.payload.get("retry_policy"))
+        return NO_RETRY
+
+    def _attempt_until_settled(
+        self,
+        request: ToolRequest,
+        call_id: str,
+        policy: RetryPolicy,
+        *,
+        attempt: int,
+    ) -> Any:
+        """Run the attempts of one logical call until it settles; return its result.
+
+        Each attempt is journalled before it happens and its outcome after, and
+        a retry is journalled before the wait -- so the journal always describes
+        exactly as much as the process actually did, no matter when it died.
+        """
+        while True:
+            if not self._runner.can_attempt(call_id, attempt):
+                # Only a replay gets here: the recorded history ends between the
+                # scheduled retry and its attempt, so there is nothing to serve
+                # and nothing to invent. The call is left exactly as durable as
+                # the journal already made it.
+                return None
+
+            self._append(
+                EventType.TOOL_STARTED,
+                {"call_id": call_id, "tool": request.tool, "attempt": attempt},
+            )
+            outcome = self._runner.run(request)
+
+            if outcome.succeeded:
+                self._append(
+                    EventType.TOOL_COMPLETED,
+                    {
+                        "call_id": call_id,
+                        "tool": request.tool,
+                        "attempt": attempt,
+                        "result": outcome.result,
+                    },
+                )
+                return outcome.result
+
             self._append(
                 EventType.TOOL_FAILED,
                 {
                     "call_id": call_id,
                     "tool": request.tool,
+                    "attempt": attempt,
                     "error": dict(outcome.error or {}),
                 },
             )
-            error = self._runner.invocation_error(request, outcome)
-            error.call_id = call_id
-            if outcome.cause is not None:
-                raise error from outcome.cause
-            raise error
 
+            decision = self._runner.retry_decision(
+                request, outcome, call_id=call_id, attempt=attempt, policy=policy
+            )
+            if decision is None:
+                error = self._runner.invocation_error(request, outcome)
+                error.call_id = call_id
+                error.attempts = attempt
+                if outcome.cause is not None:
+                    raise error from outcome.cause
+                raise error
+
+            self._schedule_retry(call_id, request.tool, decision)
+            attempt = decision.attempt
+
+    def _schedule_retry(
+        self, call_id: str, tool: str, decision: RetryDecision
+    ) -> None:
+        """Journal the retry decision, then wait for it.
+
+        The order is the point: ``ToolRetryScheduled`` is committed *before* the
+        sleep, so a process that dies while waiting leaves the decision
+        recoverable instead of losing it with the sleep.
+        """
         self._append(
-            EventType.TOOL_COMPLETED,
-            {"call_id": call_id, "tool": request.tool, "result": outcome.result},
+            EventType.TOOL_RETRY_SCHEDULED,
+            {
+                "call_id": call_id,
+                "tool": tool,
+                "attempt": decision.attempt,
+                "failed_attempt": decision.failed_attempt,
+                "delay": decision.delay,
+                "reason": decision.reason,
+                "error": dict(decision.error or {}),
+            },
         )
-        return outcome.result
+        self._sleeper.sleep(decision.delay)
 
     def complete(self, result: Any = None) -> None:
         """Mark the execution COMPLETED and journal ``ExecutionCompleted``."""
@@ -313,9 +531,10 @@ class Execution:
 
         Settling the last open call moves the execution out of
         ``RECOVERY_REQUIRED`` and back to ``RUNNING``, so it can carry on.
-        Re-running an unfinished call is deliberately not offered here: until the
-        retry milestone lands, the runtime never runs a tool whose outcome it
-        does not know.
+        Re-running an unfinished call is deliberately not offered here: a
+        :class:`~agent_runtime.retry.RetryPolicy` retries *recorded failures*,
+        never work whose outcome the journal does not know, so resuming this one
+        still requires a decision from the application.
 
         Returns a fresh checkpoint of the resolved state, or ``None`` when
         automatic checkpointing is off.
@@ -335,15 +554,24 @@ class Execution:
                 f"Execution {self._id!r} has no tool call {call_id!r} to resolve"
             )
         if not call.status.is_incomplete:
+            hint = (
+                "; it has a retry scheduled instead, so carry it on with "
+                "continue_pending_retry(...)"
+                if call.pending_retry is not None
+                else ""
+            )
             raise InvalidRecoveryActionError(
                 f"Tool call {call_id!r} of execution {self._id!r} is already "
-                f"{call.status} and needs no recovery"
+                f"{call.status} and needs no recovery{hint}"
             )
 
         payload: dict[str, Any] = {
             "call_id": call_id,
             "tool": call.tool,
             "resolution": action,
+            # The outcome belongs to the attempt that was left open, so the
+            # attempt history keeps making sense after a resolution.
+            "attempt": max(call.attempt, 1),
         }
         if event_type is EventType.TOOL_COMPLETED:
             payload["result"] = make_jsonable(result)
@@ -425,4 +653,6 @@ class Execution:
         lines.extend(f"  {call}" for call in self.tool_calls)
         for item in self.incomplete_tools:
             lines.append(f"  ! {item} [{item.status}] stuck at sequence {item.sequence}")
+        for retry in self.pending_retries:
+            lines.append(f"  ~ {retry} (recorded at sequence {retry.sequence})")
         return "\n".join(lines)

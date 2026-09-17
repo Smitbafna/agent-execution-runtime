@@ -11,7 +11,7 @@ It also supports deterministic replay, retries, idempotency, and eventually time
 * [x] Crash recovery and resume
 * [x] Deterministic execution replay
 * [x] Checkpoints and state reconstruction
-* [ ] Tool retries with exponential backoff
+* [x] Tool retries with exponential backoff
 * [ ] Idempotent tool execution
 * [ ] Tool timeouts and cancellation
 * [ ] Execution inspection and debugging
@@ -45,6 +45,163 @@ pip install -e .
 ```bash
 agent-runtime --help
 ```
+
+## Milestone 4A: retries and attempt semantics
+
+The invariant this milestone is built around:
+
+> A logical tool call keeps one stable `call_id` while it may make several
+> numbered attempts; every attempt is journalled, and the state reports the
+> final one.
+
+```python
+from agent_runtime import RetryPolicy, RetryableToolError, Runtime
+
+runtime = Runtime("agent.db")
+
+@runtime.tool(retry_policy=RetryPolicy(max_attempts=3, initial_delay=0.1))
+def fetch_data(url: str):
+    if upstream_is_down():
+        raise RetryableToolError("503")   # eligible for retry
+    if bad_request(url):
+        raise PermanentToolError("400")   # never retried
+    return download(url)
+
+execution = runtime.start(goal="Fetch the data")
+execution.call("fetch_data", url="https://example.com/data")
+
+call = execution.tool_calls[0]
+call.call_id      # call_123 -- the same id for every attempt
+call.status       # COMPLETED
+call.attempt      # 3 -- the attempt that settled it
+call.attempts     # (attempt 1 !! 503, attempt 2 !! 503, attempt 3 -> {...})
+```
+
+Three failures of one call and a success is a **COMPLETED call on attempt 3**,
+not a failed call -- and the two failures are still in the journal, in full.
+
+### Logical calls versus attempts
+
+| | |
+| --- | --- |
+| `execution.call("fetch_data", ...)` | one **logical call**, one stable `call_id` |
+| one invocation of that tool | one **attempt**, numbered from 1 |
+| `call.attempt` | the final attempt number |
+| `call.attempts` | every attempt, folded from the journal |
+
+### What gets retried
+
+Only a tool saying so. `RetryableToolError` is the one thing that makes an
+attempt eligible for a retry, and nothing is inferred from how transient a
+failure looks:
+
+| | |
+| --- | --- |
+| `RetryableToolError` | retried while attempts remain |
+| `PermanentToolError` | never retried, whatever the policy says |
+| anything else | **not** retried by default (`retry_on_unknown=True` opts in) |
+
+### Configuring the policy
+
+```python
+# per tool
+@tool(retry_policy=RetryPolicy(max_attempts=3))
+def fetch_data(url: str): ...
+
+# per call -- this one wins
+execution.call("fetch_data", retry_policy=RetryPolicy(max_attempts=5))
+```
+
+Call-level, then tool-level, then *no retries*. With nothing configured, a call
+gets exactly one attempt: the behaviour every milestone before this one had.
+
+### Backoff, and not waiting for it in tests
+
+`delay(n) = min(initial_delay * multiplier ** (n - 1), max_delay)` -- so with
+the policy above, the waits after attempts 1, 2 and 3 are `0.1`, `0.2`, `0.4`,
+capped at `max_delay`. No jitter, so the schedule is deterministic.
+
+The runtime waits through an injectable `Sleeper`, and production is only one
+implementation of it:
+
+```python
+from agent_runtime import RecordingSleeper, Runtime
+
+sleeper = RecordingSleeper()
+runtime = Runtime("agent.db", sleeper=sleeper)     # tests never wait
+...
+assert sleeper.delays == (0.1, 0.2)                # they assert the schedule
+```
+
+Nothing monkey-patches `time.sleep`.
+
+### The retry is durable, and it is journalled
+
+`ToolRetryScheduled` is committed **before** the wait and before the attempt, so
+a process that dies mid-backoff leaves the decision behind:
+
+```text
+ToolRequested
+ToolStarted          attempt=1
+ToolFailed           attempt=1
+ToolRetryScheduled   attempt=2   ← committed here
+ToolStarted          attempt=2
+ToolCompleted        attempt=2
+```
+
+A scheduled-but-unstarted retry is a *decision*, not an ambiguity, so recovery
+surfaces it rather than asking the application to resolve it:
+
+```python
+runtime = Runtime("agent.db")                 # a brand new process
+execution = runtime.resume(execution_id)
+
+execution.status           # RUNNING -- not RECOVERY_REQUIRED
+execution.pending_retries  # (attempt 1 failed; retry 2 scheduled after 0.1s,)
+
+if execution.pending_retries:
+    execution.continue_pending_retry(call_id)  # makes attempt 2, using the
+                                               # policy the call was journalled with
+```
+
+Checkpoints and replay both work across retry events, and the crash tests kill a
+real child process with `os._exit` in the middle of a backoff to prove it.
+
+### Replaying a retried run
+
+Replay substitutes *recorded attempts*, through the same REPLAY runner as
+Milestone 3: attempt 1's recorded failure, attempt 2's recorded failure,
+attempt 3's recorded result, with no tool executing and no backoff spent. The
+replayed state equals the original's field for field, attempt numbers included.
+
+```bash
+agent-runtime replay <execution-id>
+```
+
+```text
+✓ fetch_data (attempt 3/3)
+
+Replay completed
+
+Events replayed: 11
+Tools replayed: 1
+Retries replayed: 2 (delays: [0.1, 0.2])
+State: MATCHED
+```
+
+### API
+
+| | |
+| --- | --- |
+| `RetryPolicy(max_attempts, initial_delay, multiplier, max_delay)` | immutable; `should_retry(error, attempt)`, `delay(attempt)` |
+| `RetryPolicy.none()` / `NO_RETRY` | the default: exactly one attempt |
+| `RetryableToolError` / `PermanentToolError` | the explicit classification |
+| `retry_on_unknown=True` | opt into retrying exceptions the tool did not classify |
+| `execution.call(name, retry_policy=...)` | call-level policy, beats the tool's |
+| `execution.pending_retries` | retries scheduled but not started |
+| `execution.continue_pending_retry(call_id)` | carry one on after a crash |
+| `Runtime(..., sleeper=...)` | how backoff waits; `RecordingSleeper` in tests |
+| `ToolCall.attempt` / `.attempts` / `.pending_retry` | the attempt semantics in the state |
 
 ## Milestone 3: deterministic replay
 
@@ -239,8 +396,12 @@ Arguments:
     suite='unit'
 ```
 
-The runtime does **not** retry. The application decides, and the decision is
-journalled so the next resume does not ask again.
+The runtime does **not** re-run work whose outcome the journal does not
+record. Milestone 4A retries *recorded failures* -- a `ToolFailed` it wrote
+itself -- and never a call whose outcome is unknown, so this decision still
+belongs to the application, and it is journalled so the next resume does not
+ask again. A retry that was *scheduled* before the crash is a different thing
+entirely: see `execution.pending_retries`.
 
 ### Consistency
 
@@ -257,6 +418,7 @@ reported with `CorruptCheckpointError` rather than silently ignored.
 python examples/basic_usage.py          # journal, tools, recovery
 python examples/checkpoint_recovery.py  # checkpoint, real crash, recovery, decision
 python examples/replay.py               # replay without re-running tools, and a mismatch
+python examples/retries.py              # attempts, backoff, classification, a crash mid-retry
 ```
 
 ## Tests
@@ -273,6 +435,17 @@ one of them asserts that the recovered state equals a full reconstruction.
 `tests/test_replay.py` adds the replay suite: completed and interrupted
 executions, failed tools, checkpoint replay, every mismatch kind, and a
 counter-based tool proving the real function never runs twice.
+
+`tests/test_retry_policy.py`, `tests/test_retries.py`,
+`tests/test_retry_durability.py` and `tests/test_retry_replay.py` are the
+Milestone 4A suite: the policy and its backoff, the classification rules, the
+attempt loop and its journal, checkpoint and process-restart recovery across
+retry events, and replay of a retried run. One of them kills a child process
+with `os._exit` in the middle of a backoff — after `ToolRetryScheduled` was
+committed, before the attempt it scheduled — and asserts the recovered
+execution still knows the retry was scheduled and still holds the attempt
+history. No test waits: they all inject a `RecordingSleeper`, so the whole suite
+runs in seconds.
 
 ## License
 

@@ -28,6 +28,8 @@ from .exceptions import StateReconstructionError
 __all__ = [
     "ExecutionStatus",
     "ToolCallStatus",
+    "ToolAttempt",
+    "PendingRetry",
     "ToolCall",
     "IncompleteTool",
     "ExecutionState",
@@ -37,6 +39,7 @@ __all__ = [
     "apply_event",
     "reconstruct_state",
     "detect_incomplete_tools",
+    "detect_pending_retries",
     "resolve_status",
     "finalize_state",
     "replace_state",
@@ -63,6 +66,12 @@ class ToolCallStatus(StrEnum):
     STARTED = "STARTED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    #: An attempt failed, and the journal recorded that another one is
+    #: scheduled. Not incomplete: nothing is ambiguous about it -- the events
+    #: say exactly what happens next -- so it does not make an execution
+    #: ``RECOVERY_REQUIRED``. It is transient: the next ``ToolStarted``
+    #: consumes it.
+    RETRYING = "RETRYING"
     CANCELLED = "CANCELLED"
 
     @property
@@ -87,8 +96,137 @@ INCOMPLETE_TOOL_STATUSES: frozenset[ToolCallStatus] = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
+class ToolAttempt:
+    """One concrete execution attempt of a logical tool call.
+
+    Milestone 4A separates the two things Milestone 1 called "a tool call":
+
+    * the **logical call** -- one :class:`ToolCall`, one stable ``call_id``;
+    * an **attempt** -- one invocation, numbered from 1.
+
+    A call that fails and is retried therefore owns several of these while
+    still being a single call: the attempt history is what the journal records,
+    and this is the folded view of it.
+    """
+
+    attempt: int
+    status: ToolCallStatus = ToolCallStatus.STARTED
+    started_sequence: int = 0
+    completed_sequence: int = 0
+    started_at: str | None = None
+    result: Any = None
+    error: Mapping[str, Any] | None = None
+    #: The retry this attempt's failure scheduled, if it scheduled one.
+    #:
+    #: Kept on the *attempt* rather than only on the call, because the call's
+    #: pending slot is consumed as soon as the next attempt starts. The
+    #: decision itself must survive that: a replay reads it back from here to
+    #: reproduce the recorded retry rather than making its own.
+    scheduled_retry: PendingRetry | None = None
+
+    @property
+    def settled(self) -> bool:
+        """True when this attempt's outcome was recorded (not left open)."""
+        return not self.status.is_incomplete
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "status": str(self.status),
+            "started_sequence": self.started_sequence,
+            "completed_sequence": self.completed_sequence,
+            "started_at": self.started_at,
+            "result": self.result,
+            "error": self.error,
+            "scheduled_retry": (
+                None if self.scheduled_retry is None else self.scheduled_retry.to_dict()
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ToolAttempt":
+        scheduled = data.get("scheduled_retry")
+        return cls(
+            attempt=int(data.get("attempt") or 1),
+            status=ToolCallStatus(data.get("status") or ToolCallStatus.STARTED),
+            started_sequence=int(data.get("started_sequence") or 0),
+            completed_sequence=int(data.get("completed_sequence") or 0),
+            started_at=data.get("started_at"),
+            result=data.get("result"),
+            error=data.get("error"),
+            scheduled_retry=None if scheduled is None else PendingRetry.from_dict(scheduled),
+        )
+
+    def __str__(self) -> str:
+        if self.status is ToolCallStatus.COMPLETED:
+            return f"attempt {self.attempt} -> {self.result!r}"
+        if self.status is ToolCallStatus.FAILED:
+            message = (self.error or {}).get("message", "failed")
+            return f"attempt {self.attempt} !! {message}"
+        return f"attempt {self.attempt} [{self.status}]"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingRetry:
+    """A retry the journal recorded but had not carried out yet.
+
+    Produced by ``ToolRetryScheduled`` and consumed by the next
+    ``ToolStarted``. It exists as its own value because a process can die in
+    exactly that window -- after the decision was made durable, before the
+    attempt began -- and a resumed execution has to be able to say "a retry was
+    scheduled for attempt 2" rather than pretending the call simply failed.
+    """
+
+    #: The attempt that was scheduled (the ``attempt=2`` of the event).
+    attempt: int
+    #: The attempt that failed and caused it.
+    failed_attempt: int = 0
+    #: Seconds the retry was to wait before starting.
+    delay: float = 0.0
+    #: Why the retry was allowed -- the ``ErrorKind`` that permitted it.
+    reason: str = ""
+    #: The failure that triggered it.
+    error: Mapping[str, Any] | None = None
+    #: Where in the journal the decision was recorded.
+    sequence: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "failed_attempt": self.failed_attempt,
+            "delay": self.delay,
+            "reason": self.reason,
+            "error": self.error,
+            "sequence": self.sequence,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PendingRetry":
+        return cls(
+            attempt=int(data.get("attempt") or 1),
+            failed_attempt=int(data.get("failed_attempt") or 0),
+            delay=float(data.get("delay") or 0.0),
+            reason=str(data.get("reason") or ""),
+            error=data.get("error"),
+            sequence=int(data.get("sequence") or 0),
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"attempt {self.failed_attempt or '?'} failed; retry {self.attempt} "
+            f"scheduled after {self.delay}s"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ToolCall:
     """One tool call, as reconstructed from its events.
+
+    A logical call, however many attempts it took: ``call_id`` is stable across
+    retries, ``attempt`` is the final attempt number, and :attr:`attempts` is
+    the folded history of how it got there. The journal remains the source of
+    truth for that history -- this is the same view the reducers produce from
+    it, in the same way a checkpoint is.
 
     The ``*_sequence`` fields record *where in the journal* each phase of the
     call was last seen. They are what lets recovery name the event an
@@ -106,14 +244,34 @@ class ToolCall:
     started_sequence: int = 0
     completed_sequence: int = 0
     started_at: str | None = None
+    #: The final attempt number: ``0`` until the first attempt starts, then the
+    #: attempt this call ended on. A call that succeeded on its third try
+    #: reports ``attempt=3`` and ``status=COMPLETED``, not ``FAILED``.
+    attempt: int = 0
+    #: Every attempt this logical call made, in order.
+    attempts: tuple[ToolAttempt, ...] = ()
+    #: A retry the journal recorded but had not started yet, if any.
+    pending_retry: PendingRetry | None = None
+
+    @property
+    def attempt_count(self) -> int:
+        """How many attempts this call made."""
+        return len(self.attempts)
+
+    def attempt_record(self, number: int) -> ToolAttempt | None:
+        """The recorded attempt ``number``, or ``None`` if it never happened."""
+        return next((a for a in self.attempts if a.attempt == number), None)
 
     def __str__(self) -> str:
         args = ", ".join(f"{k}={v!r}" for k, v in self.arguments.items())
+        suffix = f" (attempt {self.attempt})" if self.attempt > 1 else ""
         if self.status is ToolCallStatus.COMPLETED:
-            return f"{self.tool}({args}) -> {self.result!r}"
+            return f"{self.tool}({args}) -> {self.result!r}{suffix}"
         if self.status is ToolCallStatus.FAILED:
             message = (self.error or {}).get("message", "failed")
-            return f"{self.tool}({args}) !! {message}"
+            return f"{self.tool}({args}) !! {message}{suffix}"
+        if self.status is ToolCallStatus.RETRYING:
+            return f"{self.tool}({args}) {self.pending_retry}"
         if self.status is ToolCallStatus.CANCELLED:
             return f"{self.tool}({args}) -- cancelled"
         return f"{self.tool}({args}) [{self.status}]"
@@ -130,10 +288,14 @@ class ToolCall:
             "started_sequence": self.started_sequence,
             "completed_sequence": self.completed_sequence,
             "started_at": self.started_at,
+            "attempt": self.attempt,
+            "attempts": [item.to_dict() for item in self.attempts],
+            "pending_retry": None if self.pending_retry is None else self.pending_retry.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ToolCall":
+        pending = data.get("pending_retry")
         return cls(
             call_id=data["call_id"],
             tool=data["tool"],
@@ -145,6 +307,11 @@ class ToolCall:
             started_sequence=int(data.get("started_sequence") or 0),
             completed_sequence=int(data.get("completed_sequence") or 0),
             started_at=data.get("started_at"),
+            attempt=int(data.get("attempt") or 0),
+            attempts=tuple(
+                ToolAttempt.from_dict(item) for item in data.get("attempts") or ()
+            ),
+            pending_retry=None if pending is None else PendingRetry.from_dict(pending),
         )
 
 
@@ -365,56 +532,185 @@ def _on_tool_requested(state: ExecutionState, event: Event) -> ExecutionState:
 
 
 def _on_tool_started(state: ExecutionState, event: Event) -> ExecutionState:
+    attempt = _attempt_number(event)
+    call = _call_of(state, event)
     return _update_call(
         state,
         event,
         status=ToolCallStatus.STARTED,
+        attempt=attempt,
+        attempts=_record_attempt(
+            call.attempts,
+            ToolAttempt(
+                attempt=attempt,
+                status=ToolCallStatus.STARTED,
+                started_sequence=event.sequence,
+                started_at=event.timestamp,
+            ),
+        ),
+        # A scheduled retry is being carried out now, so it is no longer pending.
+        pending_retry=None,
         started_sequence=event.sequence,
         started_at=event.timestamp,
     )
 
 
 def _on_tool_completed(state: ExecutionState, event: Event) -> ExecutionState:
-    return _update_call(
-        state,
-        event,
-        status=ToolCallStatus.COMPLETED,
-        result=event.payload.get("result"),
-        completed_sequence=event.sequence,
+    return _settle_call(
+        state, event, ToolCallStatus.COMPLETED, result=event.payload.get("result")
     )
 
 
 def _on_tool_failed(state: ExecutionState, event: Event) -> ExecutionState:
-    return _update_call(
-        state,
-        event,
-        status=ToolCallStatus.FAILED,
+    return _settle_call(
+        state, event, ToolCallStatus.FAILED, error=event.payload.get("error") or {}
+    )
+
+
+def _on_tool_retry_scheduled(state: ExecutionState, event: Event) -> ExecutionState:
+    """Record the decision to make another attempt, before any of it happens.
+
+    The call is left ``RETRYING`` with a :class:`PendingRetry`: an unfinished
+    but *unambiguous* state, since the journal now says exactly which attempt
+    comes next. The same decision is also recorded on the attempt that made it,
+    so it survives the next ``ToolStarted`` consuming the pending slot -- which
+    is what lets a replay reproduce the retry instead of re-deciding it.
+    """
+    attempt = _attempt_number(event)
+    failed_attempt = event.payload.get("failed_attempt")
+    pending = PendingRetry(
+        attempt=attempt,
+        failed_attempt=int(failed_attempt) if failed_attempt is not None else max(attempt - 1, 0),
+        delay=float(event.payload.get("delay") or 0.0),
+        reason=str(event.payload.get("reason") or ""),
         error=event.payload.get("error") or {},
-        completed_sequence=event.sequence,
+        sequence=event.sequence,
+    )
+    call = _call_of(state, event)
+    # Default to the attempt this call is currently on, which is the one that
+    # just failed; an event that names its own failed attempt wins.
+    failed = pending.failed_attempt or call.attempt or attempt - 1
+    failed_record = call.attempt_record(failed)
+    updated = _update_call(
+        state, event, status=ToolCallStatus.RETRYING, pending_retry=pending
+    )
+    if failed_record is None:
+        # A journal that scheduled a retry for an attempt it never recorded as
+        # failed. The pending decision still stands -- it is what happens next --
+        # but there is no attempt to attach it to.
+        return updated
+    return _update_call(
+        updated,
+        event,
+        attempts=_record_attempt(
+            call.attempts, replace(failed_record, scheduled_retry=pending)
+        ),
     )
 
 
 def _on_tool_cancelled(state: ExecutionState, event: Event) -> ExecutionState:
-    return _update_call(
+    return _settle_call(
         state,
         event,
-        status=ToolCallStatus.CANCELLED,
+        ToolCallStatus.CANCELLED,
         error=event.payload.get("error") or {},
-        completed_sequence=event.sequence,
     )
 
 
-def _update_call(state: ExecutionState, event: Event, **changes: Any) -> ExecutionState:
+# -- attempt bookkeeping ---------------------------------------------------
+
+
+def _attempt_number(event: Event) -> int:
+    """The attempt an event belongs to.
+
+    Events written before Milestone 4A carry no ``attempt``, and a single
+    attempt is exactly what they describe, so the default is 1. That is what
+    keeps every older journal readable.
+    """
+    try:
+        return max(int(event.payload.get("attempt") or 1), 1)
+    except (TypeError, ValueError) as exc:
+        raise StateReconstructionError(
+            f"Event at sequence {event.sequence} of {event.execution_id!r} has a "
+            f"non-numeric attempt {event.payload.get('attempt')!r}"
+        ) from exc
+
+
+def _record_attempt(
+    existing: tuple[ToolAttempt, ...], entry: ToolAttempt
+) -> tuple[ToolAttempt, ...]:
+    """Insert ``entry`` into an attempt history, or merge it into the same attempt.
+
+    One attempt is journalled by two events -- a start and an outcome -- so the
+    second folds into the first rather than becoming a second attempt.
+    """
+    for index, current in enumerate(existing):
+        if current.attempt == entry.attempt:
+            merged = replace(
+                entry,
+                started_sequence=entry.started_sequence or current.started_sequence,
+                started_at=entry.started_at or current.started_at,
+                scheduled_retry=entry.scheduled_retry or current.scheduled_retry,
+            )
+            return existing[:index] + (merged,) + existing[index + 1 :]
+    return existing + (entry,)
+
+
+def _settle_call(
+    state: ExecutionState,
+    event: Event,
+    status: ToolCallStatus,
+    *,
+    result: Any = None,
+    error: Mapping[str, Any] | None = None,
+) -> ExecutionState:
+    """Record an attempt's outcome on both the attempt history and the call."""
+    attempt = _attempt_number(event)
+    call = _call_of(state, event)
+    started_here = attempt == call.attempt
+    return _update_call(
+        state,
+        event,
+        status=status,
+        attempt=attempt,
+        result=result,
+        error=error,
+        completed_sequence=event.sequence,
+        attempts=_record_attempt(
+            call.attempts,
+            ToolAttempt(
+                attempt=attempt,
+                status=status,
+                # Carried over from the call when this attempt is the one that
+                # was started; an outcome with no start event of its own (a
+                # recovery resolution) keeps whatever start the call recorded.
+                started_sequence=call.started_sequence if started_here else 0,
+                started_at=call.started_at if started_here else None,
+                completed_sequence=event.sequence,
+                result=result,
+                error=error,
+            ),
+        ),
+    )
+
+
+def _call_of(state: ExecutionState, event: Event) -> ToolCall:
+    """The tool call an event refers to, or an explanation that there is none."""
     call_id = event.payload.get("call_id")
-    for index, call in enumerate(state.tool_calls):
+    for call in state.tool_calls:
         if call.call_id == call_id:
-            updated = replace(call, **changes)
-            calls = state.tool_calls[:index] + (updated,) + state.tool_calls[index + 1 :]
-            return replace(state, tool_calls=calls)
+            return call
     raise StateReconstructionError(
         f"Event at sequence {event.sequence} references unknown tool call {call_id!r} "
         f"(execution {event.execution_id!r})"
     )
+
+
+def _update_call(state: ExecutionState, event: Event, **changes: Any) -> ExecutionState:
+    call = _call_of(state, event)  # raises if the event names no known call
+    calls = list(state.tool_calls)
+    calls[state.tool_calls.index(call)] = replace(call, **changes)
+    return replace(state, tool_calls=tuple(calls))
 
 
 _REDUCERS: dict[EventType, Any] = {
@@ -426,8 +722,21 @@ _REDUCERS: dict[EventType, Any] = {
     EventType.TOOL_STARTED: _on_tool_started,
     EventType.TOOL_COMPLETED: _on_tool_completed,
     EventType.TOOL_FAILED: _on_tool_failed,
+    EventType.TOOL_RETRY_SCHEDULED: _on_tool_retry_scheduled,
     EventType.TOOL_CANCELLED: _on_tool_cancelled,
 }
+
+
+def detect_pending_retries(state: ExecutionState) -> tuple[PendingRetry, ...]:
+    """Retries the journal scheduled but never started.
+
+    Unlike :func:`detect_incomplete_tools`, these are *not* ambiguities: each
+    one says exactly which attempt comes next, so a resumed execution can carry
+    it on instead of asking the application to decide.
+    """
+    return tuple(
+        call.pending_retry for call in state.tool_calls if call.pending_retry is not None
+    )
 
 
 def detect_incomplete_tools(state: ExecutionState) -> tuple[IncompleteTool, ...]:

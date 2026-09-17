@@ -4,8 +4,17 @@ Tools are plain Python functions. The :func:`tool` decorator turns one into a
 :class:`Tool`, and :class:`ToolRegistry` resolves names to tools for the
 execution runtime.
 
-Scope note (Milestone 1): there are **no** retries, timeouts or idempotency
-keys here. A failing tool records a failure and re-raises.
+Since Milestone 4A a tool may also declare how its failures should be retried::
+
+    @tool(retry_policy=RetryPolicy(max_attempts=3))
+    def fetch_data(url: str): ...
+
+That is the *default* for calls of this tool; a single call may override it
+with ``execution.call("fetch_data", retry_policy=RetryPolicy(max_attempts=5))``.
+
+Scope note: there are no idempotency keys, timeouts or cancellation here, and
+no configuration language for retries -- a :class:`~agent_runtime.retry.RetryPolicy`
+is five numbers and nothing more.
 """
 
 from __future__ import annotations
@@ -17,13 +26,22 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
 from .exceptions import (
+    RetryConfigurationError,
     ToolAlreadyRegisteredError,
     ToolArgumentError,
     ToolInvocationError,
     ToolNotFoundError,
 )
+from .retry import RetryPolicy
 
-__all__ = ["Tool", "ToolRegistry", "tool", "make_jsonable", "default_registry"]
+__all__ = [
+    "Tool",
+    "ToolRegistry",
+    "tool",
+    "make_jsonable",
+    "check_retry_policy",
+    "default_registry",
+]
 
 
 def make_jsonable(value: Any) -> Any:
@@ -56,6 +74,13 @@ class Tool:
     name: str
     func: Callable[..., Any]
     description: str = ""
+    #: The retry policy calls of this tool use unless the call overrides it
+    #: (Milestone 4A). ``None`` means "whatever the caller says", which for a
+    #: call that says nothing is :attr:`RetryPolicy.none`.
+    retry_policy: RetryPolicy | None = None
+
+    def __post_init__(self) -> None:
+        check_retry_policy(self.retry_policy, tool_name=self.name)
 
     @property
     def signature(self) -> inspect.Signature:
@@ -82,11 +107,30 @@ class Tool:
         return self.func(*bound.args, **bound.kwargs)
 
 
+def check_retry_policy(
+    policy: RetryPolicy | None, *, tool_name: str | None = None
+) -> RetryPolicy | None:
+    """Validate a retry policy where it is supplied, and return it unchanged.
+
+    A policy that is not a :class:`~agent_runtime.retry.RetryPolicy` is a
+    programming error, so it is reported where it was written rather than at the
+    first failing tool call.
+    """
+    if policy is None or isinstance(policy, RetryPolicy):
+        return policy
+    where = f" for tool {tool_name!r}" if tool_name else ""
+    raise RetryConfigurationError(
+        f"retry_policy{where} must be a RetryPolicy or None, got "
+        f"{type(policy).__name__}"
+    )
+
+
 def tool(
     func: Callable[..., Any] | None = None,
     *,
     name: str | None = None,
     description: str | None = None,
+    retry_policy: RetryPolicy | None = None,
 ) -> Any:
     """Register a function as a tool. Works bare or called::
 
@@ -95,13 +139,21 @@ def tool(
 
         @tool(name="sum_two")
         def add(a: int, b: int): ...
+
+        @tool(retry_policy=RetryPolicy(max_attempts=3))
+        def fetch_data(url: str): ...
     """
 
     def decorator(target: Callable[..., Any]) -> Tool:
         doc = description
         if doc is None:
             doc = (inspect.getdoc(target) or "").strip().split("\n")[0]
-        return Tool(name=name or target.__name__, func=target, description=doc or "")
+        return Tool(
+            name=name or target.__name__,
+            func=target,
+            description=doc or "",
+            retry_policy=check_retry_policy(retry_policy, tool_name=name or target.__name__),
+        )
 
     if func is None:
         return decorator
@@ -171,7 +223,14 @@ class ToolRegistry:
         if not isinstance(item, Tool):
             item = tool(item, name=name)
         elif name is not None and name != item.name:
-            item = Tool(name=name, func=item.func, description=item.description)
+            # Renaming must not drop the tool's retry policy: it describes the
+            # tool, not the name it is filed under.
+            item = Tool(
+                name=name,
+                func=item.func,
+                description=item.description,
+                retry_policy=item.retry_policy,
+            )
         if item.name in self._tools:
             raise ToolAlreadyRegisteredError(f"Tool {item.name!r} is already registered")
         self._tools[item.name] = item

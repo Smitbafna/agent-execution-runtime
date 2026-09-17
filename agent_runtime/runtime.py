@@ -21,9 +21,10 @@ from .exceptions import ExecutionExistsError
 from .journal import EventJournal
 from .replay import ReplayEngine, ReplayResult, ReplayStep
 from .recovery import RecoveryInfo, recover_execution
+from .retry import RealSleeper, RetryPolicy, Sleeper
 from .state import ExecutionState, reconstruct_state
 from .storage import DbPath, SQLiteStore
-from .tools import Tool, ToolRegistry
+from .tools import Tool, ToolRegistry, tool  # noqa: F401 - ``tool`` is the decorator
 
 __all__ = ["Runtime"]
 
@@ -38,6 +39,7 @@ class Runtime:
         tools: Iterable[Tool | Callable[..., Any]] | None = None,
         register_default_tools: bool = True,
         auto_checkpoint: bool = False,
+        sleeper: Sleeper | None = None,
     ) -> None:
         """
         Args:
@@ -48,12 +50,18 @@ class Runtime:
                 (``complete``, ``fail``, ``mark_cancelled``, recovery
                 resolutions). Off by default: milestones call
                 :meth:`Execution.checkpoint` where they want a snapshot.
+            sleeper: how retry backoff waits. Defaults to
+                :class:`~agent_runtime.retry.RealSleeper`; pass a
+                :class:`~agent_runtime.retry.RecordingSleeper` in a test to
+                assert the schedule without spending it.
         """
         self.store = SQLiteStore(db_path)
         self.journal = EventJournal(self.store)
         self.checkpoints = CheckpointStore(self.store)
         self.registry = ToolRegistry(tools, register_defaults=register_default_tools)
         self.auto_checkpoint = auto_checkpoint
+        #: Shared by every execution this runtime hands out.
+        self.sleeper = sleeper if sleeper is not None else RealSleeper()
 
     # -- tools ---------------------------------------------------------------
 
@@ -63,7 +71,13 @@ class Runtime:
         """Make a tool callable from executions (``execution.call(name, ...)``)."""
         return self.registry.register(item, name)
 
-    def tool(self, func: Callable[..., Any] | None = None, **kwargs: Any) -> Any:
+    def tool(
+        self,
+        func: Callable[..., Any] | None = None,
+        *,
+        name: str | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ) -> Any:
         """Decorator form of :meth:`register_tool`::
 
             @runtime.tool
@@ -71,13 +85,18 @@ class Runtime:
 
             @runtime.tool(name="shout")
             def greet(name: str): ...
+
+            @runtime.tool(retry_policy=RetryPolicy(max_attempts=3))
+            def greet(name: str): ...
         """
         if func is None:
             def decorator(target: Callable[..., Any]) -> Tool:
-                return self.registry.register(target, kwargs.get("name"))
+                return self.registry.register(
+                    tool(target, name=name, retry_policy=retry_policy)
+                )
 
             return decorator
-        return self.registry.register(func, kwargs.get("name"))
+        return self.registry.register(tool(func, name=name, retry_policy=retry_policy))
 
     # -- executions ----------------------------------------------------------
 
@@ -221,6 +240,7 @@ class Runtime:
             checkpoints=self.checkpoints,
             recovered_state=recovered_state,
             auto_checkpoint=self.auto_checkpoint,
+            sleeper=self.sleeper,
         )
 
     # -- lifecycle -----------------------------------------------------------

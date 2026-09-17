@@ -43,7 +43,7 @@ global interception.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
 
 from .checkpoints import CheckpointStore
@@ -57,9 +57,11 @@ from .exceptions import (
 )
 from .execution import Execution
 from .journal import EventJournal
+from .retry import NO_RETRY, RecordingSleeper, RetryDecision, RetryPolicy, Sleeper
 from .runner import ToolOutcome, ToolRequest, ToolRunner, ToolRunnerMode
 from .state import (
     ExecutionState,
+    PendingRetry,
     ToolCall,
     ToolCallStatus,
     apply_event,
@@ -71,6 +73,7 @@ from .state import (
 from .tools import make_jsonable
 
 __all__ = [
+    "RecordedAttempt",
     "RecordedToolCall",
     "ReplayResult",
     "ReplayStep",
@@ -87,12 +90,68 @@ __all__ = [
 
 
 @dataclass(frozen=True, slots=True)
+class RecordedAttempt:
+    """One recorded attempt of a logical call, exactly as the journal saw it.
+
+    Milestone 4A: a call is a sequence of attempts, so this is the unit a
+    replay actually serves -- attempt 1's recorded failure, attempt 2's recorded
+    failure, attempt 3's recorded result. Nothing here is derived from a policy
+    during the replay; it is what the original run wrote down.
+    """
+
+    attempt: int
+    status: ToolCallStatus
+    started_sequence: int = 0
+    completed_sequence: int = 0
+    result: Any = None
+    error: Mapping[str, Any] | None = None
+    #: The retry the journal scheduled after *this* attempt failed, if it did.
+    scheduled_retry: PendingRetry | None = None
+
+    @property
+    def settled(self) -> bool:
+        """True when this attempt's outcome was recorded."""
+        return not self.status.is_incomplete
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status is ToolCallStatus.COMPLETED
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "status": str(self.status),
+            "started_sequence": self.started_sequence,
+            "completed_sequence": self.completed_sequence,
+            "result": self.result,
+            "error": self.error,
+            "scheduled_retry": (
+                None if self.scheduled_retry is None else self.scheduled_retry.to_dict()
+            ),
+        }
+
+    def __str__(self) -> str:
+        if self.succeeded:
+            return f"attempt {self.attempt} -> {self.result!r}"
+        message = (self.error or {}).get("message", "failed")
+        return f"attempt {self.attempt} !! {message}"
+
+
+@dataclass(frozen=True, slots=True)
 class RecordedToolCall:
     """One tool call as the journal recorded it: what was asked, and what came back.
 
     A replay walks these in order. ``call_id`` and ``requested_sequence`` pin
     the call to its exact place in the history, which is what lets a mismatch
     name *where* replay diverged rather than just *that* it did.
+
+    Milestone 4A splits the call from its attempts: :attr:`attempts` is every
+    attempt the journal recorded for this one ``call_id``, and
+    :attr:`scheduled_retry` is the retry the journal decided on (if the history
+    ends before that attempt ran, it is still there -- the process simply died
+    during the backoff). A replay serves them as recorded; it never re-decides
+    whether to retry, because a replay that decided for itself would be a second
+    run rather than a reproduction of the first.
     """
 
     call_id: str
@@ -103,6 +162,9 @@ class RecordedToolCall:
     status: ToolCallStatus
     result: Any = None
     error: Mapping[str, Any] | None = None
+    attempts: tuple[RecordedAttempt, ...] = ()
+    scheduled_retry: PendingRetry | None = None
+    retry_policy: RetryPolicy | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -110,8 +172,23 @@ class RecordedToolCall:
 
     @property
     def settled(self) -> bool:
-        """True when the journal recorded an outcome for this call."""
+        """True when the journal recorded an outcome for this call's last attempt."""
+        if self.attempts:
+            return self.attempts[-1].settled
         return not self.status.is_incomplete
+
+    @property
+    def attempt_count(self) -> int:
+        """How many attempts the journal recorded for this call."""
+        return len(self.attempts)
+
+    def attempt_recorded(self, attempt: int) -> bool:
+        """Whether the journal recorded an outcome for ``attempt``."""
+        return any(item.attempt == attempt for item in self.attempts)
+
+    def attempt_record(self, attempt: int) -> RecordedAttempt | None:
+        """The recorded attempt ``attempt``, or ``None`` if it never happened."""
+        return next((item for item in self.attempts if item.attempt == attempt), None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +200,11 @@ class RecordedToolCall:
             "status": str(self.status),
             "result": self.result,
             "error": self.error,
+            "attempts": [item.to_dict() for item in self.attempts],
+            "scheduled_retry": (
+                None if self.scheduled_retry is None else self.scheduled_retry.to_dict()
+            ),
+            "retry_policy": None if self.retry_policy is None else self.retry_policy.to_dict(),
         }
 
     @classmethod
@@ -136,16 +218,47 @@ class RecordedToolCall:
             status=call.status,
             result=call.result,
             error=call.error,
+            attempts=tuple(
+                RecordedAttempt(
+                    attempt=item.attempt,
+                    status=item.status,
+                    started_sequence=item.started_sequence,
+                    completed_sequence=item.completed_sequence,
+                    result=item.result,
+                    error=item.error,
+                    scheduled_retry=item.scheduled_retry,
+                )
+                for item in call.attempts
+            ),
+            scheduled_retry=call.pending_retry,
         )
 
     @classmethod
-    def recorded_from(cls, state: ExecutionState, *, since: int = 0) -> tuple["RecordedToolCall", ...]:
-        """Every tool call at or after ``since``, which a replay must reproduce."""
-        return tuple(
+    def recorded_from(
+        cls,
+        state: ExecutionState,
+        *,
+        since: int = 0,
+        policies: Mapping[str, Any] | None = None,
+    ) -> tuple["RecordedToolCall", ...]:
+        """Every tool call at or after ``since``, which a replay must reproduce.
+
+        ``policies`` optionally supplies each call's journalled retry policy
+        (keyed by ``call_id``), so a replay re-emits ``ToolRequested`` with the
+        policy the original ran under instead of the one it happens to have in
+        this process.
+        """
+        calls = (
             cls.from_tool_call(call, index)
             for index, call in enumerate(
                 call for call in state.tool_calls if call.requested_sequence > since
             )
+        )
+        if not policies:
+            return tuple(calls)
+        return tuple(
+            replace(call, retry_policy=RetryPolicy.from_dict(policies.get(call.call_id)))
+            for call in calls
         )
 
 
@@ -184,6 +297,12 @@ class ReplayToolRunner(ToolRunner):
         self._recorded = recorded
         self._execution_id = execution_id
         self._cursor = 0
+        #: The recorded call currently being served, and how far through its
+        #: recorded attempts this replay has got. One logical call, several
+        #: attempts: the call is bound once, and each attempt is served from
+        #: the same recorded history.
+        self._active: RecordedToolCall | None = None
+        self._attempt_cursor = 0
 
     @property
     def cursor(self) -> int:
@@ -195,13 +314,106 @@ class ReplayToolRunner(ToolRunner):
         """Recorded calls that have not been replayed yet."""
         return len(self._recorded) - self._cursor
 
-    def run(self, request: ToolRequest) -> ToolOutcome:
-        """Return the recorded outcome for ``request``. No tool is ever invoked."""
+    @property
+    def active_call(self) -> RecordedToolCall | None:
+        """The recorded call being replayed right now, if any."""
+        return self._active
+
+    def begin_call(self, call_id: str, request: ToolRequest) -> None:
+        """Bind the recorded call this execution is replaying.
+
+        Identity, not position: the execution hands over the ``call_id`` it is
+        about to journal, and the recorded call has to be that one. Binding by
+        identity is what lets one recorded call hold several attempts.
+        """
         call = self._match(request)
+        if call.call_id != call_id:
+            raise ReplayMismatchError(
+                f"replay is journalling call {call_id!r} where the recorded history "
+                f"has {call.call_id!r} (call #{call.index + 1})",
+                kind="call_id",
+                execution_id=self._execution_id,
+                sequence=call.requested_sequence,
+                expected={"call_id": call.call_id, "tool": call.tool},
+                received={"call_id": call_id},
+            )
+        self._active = call
+        self._attempt_cursor = 0
         self._cursor += 1
-        if call.succeeded:
-            return ToolOutcome.completed(call.result)
-        return ToolOutcome(status=call.status, error=call.error)
+
+    def can_attempt(self, call_id: str, attempt: int) -> bool:
+        """Whether the journal recorded an outcome for ``attempt`` of this call.
+
+        A history that ends after ``ToolRetryScheduled`` has nothing recorded
+        for the attempt it scheduled, so the replay stops there rather than
+        inventing one -- the same rule Milestone 3 applied to a call that never
+        settled.
+        """
+        return self._active is not None and self._active.attempt_recorded(attempt)
+
+    def retry_decision(
+        self,
+        request: ToolRequest,
+        outcome: ToolOutcome,
+        *,
+        call_id: str,
+        attempt: int,
+        policy: RetryPolicy,
+    ) -> RetryDecision | None:
+        """The retry the journal recorded after this attempt -- or ``None``.
+
+        Nothing is decided here. Each attempt's recorded decision is served --
+        including the delay it recorded -- and an attempt whose journal holds no
+        decision gets no retry, whatever policy this process happens to hold.
+        """
+        call = self._active
+        if call is None:
+            return None
+        record = call.attempt_record(attempt)
+        scheduled = record.scheduled_retry if record is not None else None
+        if scheduled is None:
+            return None
+        if scheduled.failed_attempt not in (0, attempt):
+            raise ReplayMismatchError(
+                f"replay reached attempt {attempt} of {call.tool!r} where the "
+                f"recorded retry was scheduled after attempt {scheduled.failed_attempt}",
+                kind="attempt",
+                execution_id=self._execution_id,
+                sequence=scheduled.sequence,
+                expected={"failed_attempt": scheduled.failed_attempt},
+                received={"attempt": attempt},
+            )
+        return RetryDecision(
+            attempt=scheduled.attempt,
+            failed_attempt=scheduled.failed_attempt,
+            delay=scheduled.delay,
+            reason=scheduled.reason,
+            error=dict(scheduled.error or {}),
+        )
+
+    def run(self, request: ToolRequest) -> ToolOutcome:
+        """Return the recorded outcome of the next recorded attempt. No tool runs."""
+        if self._active is None:
+            # Driven without ``begin_call``: bind the next recorded call first.
+            self.begin_call(self._match(request).call_id, request)
+        call = self._active
+        assert call is not None  # bound immediately above
+        if self._attempt_cursor >= len(call.attempts):
+            raise ReplayMismatchError(
+                f"replay asked for another attempt of {call.tool!r} (call #"
+                f"{call.index + 1}) but the journal recorded only "
+                f"{call.attempt_count} attempt(s)",
+                kind="missing_recorded_outcome",
+                execution_id=self._execution_id,
+                sequence=call.requested_sequence,
+                expected={"attempts": call.attempt_count},
+                received=request.to_dict(),
+            )
+        recorded = call.attempts[self._attempt_cursor]
+        self._attempt_cursor += 1
+        if recorded.succeeded:
+            return ToolOutcome.completed(recorded.result)
+        return ToolOutcome(status=recorded.status, error=recorded.error)
 
     def check(self, request: ToolRequest) -> RecordedToolCall:
         """Validate a request against the recorded history without consuming it.
@@ -383,6 +595,10 @@ class ReplayStep:
     ``executed`` is always ``False`` for a replay: it records that the result
     came from the journal. It stays an explicit field because "this result was
     replayed, not computed" is exactly the claim that has to remain visible.
+
+    ``attempt`` is the final attempt the journal recorded for the call, and
+    ``attempts`` every one of them -- so a call that took three tries says so in
+    the trace rather than looking like a single lucky call.
     """
 
     sequence: int
@@ -392,10 +608,17 @@ class ReplayStep:
     result: Any = None
     error: Mapping[str, Any] | None = None
     executed: bool = False
+    attempt: int = 1
+    attempts: int = 1
 
     @property
     def succeeded(self) -> bool:
         return self.status is ToolCallStatus.COMPLETED
+
+    @property
+    def retried(self) -> bool:
+        """True when the recorded call took more than one attempt."""
+        return self.attempt > 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -406,14 +629,17 @@ class ReplayStep:
             "result": self.result,
             "error": self.error,
             "executed": self.executed,
+            "attempt": self.attempt,
+            "attempts": self.attempts,
         }
 
     def __str__(self) -> str:
         args = ", ".join(f"{key}={value!r}" for key, value in self.arguments.items())
+        suffix = f" [attempt {self.attempt}/{self.attempts}]" if self.retried else ""
         if self.succeeded:
-            return f"{self.tool}({args}) -> {self.result!r}"
+            return f"{self.tool}({args}) -> {self.result!r}{suffix}"
         message = (self.error or {}).get("message", "failed")
-        return f"{self.tool}({args}) !! {message}"
+        return f"{self.tool}({args}) !! {message}{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +677,21 @@ class ReplayExecution(Execution):
         base_state: ExecutionState | None = None,
         recorded: tuple[RecordedToolCall, ...] = (),
         on_step: Callable[[ReplayStep], None] | None = None,
+        sleeper: Sleeper | None = None,
     ) -> None:
         # registry=None: this execution never resolves a tool, so there is
         # nothing for a registry to do. Replay must not depend on the tool being
         # importable in the replaying process. The runner is passed explicitly,
         # so it is the REPLAY one and not the default NORMAL one.
-        super().__init__(journal, None, execution_id, runner=runner)  # type: ignore[arg-type]
+        # A replay also never *waits*: the backoff it replays is the one the
+        # journal recorded, so the waits are recorded rather than spent.
+        super().__init__(
+            journal,
+            None,
+            execution_id,
+            runner=runner,
+            sleeper=sleeper if sleeper is not None else RecordingSleeper(),
+        )  # type: ignore[arg-type]
         self._replay_runner = runner
         self._recorded = recorded
         self._cursor = 0
@@ -464,6 +699,7 @@ class ReplayExecution(Execution):
         self._errors: list[Mapping[str, Any]] = []
         self._on_step = on_step
         self._base_state = base_state
+        self._retries = 0
         if base_state is not None:
             # Seed the cache so ``status``/``_require_running`` see the state the
             # replay resumes from rather than an empty one.
@@ -475,6 +711,17 @@ class ReplayExecution(Execution):
     def runner(self) -> ReplayToolRunner:
         """The REPLAY runner backing this execution."""
         return self._replay_runner
+
+    @property
+    def retries_replayed(self) -> int:
+        """How many scheduled retries this replay reproduced from the journal."""
+        return self._retries
+
+    @property
+    def delays_replayed(self) -> tuple[float, ...]:
+        """The backoff waits this replay reproduced (recorded, never spent)."""
+        sleeper = self._sleeper
+        return getattr(sleeper, "delays", ())
 
     @property
     def steps(self) -> tuple[ReplayStep, ...]:
@@ -512,7 +759,11 @@ class ReplayExecution(Execution):
 
         A recorded failure is reproduced as a failure -- the same
         :class:`~agent_runtime.exceptions.ToolInvocationError`, carrying the
-        recorded error type and message -- without the tool running.
+        recorded error type and message -- without the tool running. A call that
+        the journal shows being retried is replayed attempt by attempt: each
+        attempt's recorded outcome is served, and each recorded retry decision is
+        reproduced, so the replay ends up with the same attempt history the
+        original had.
 
         A call the crash left open (requested or started, never settled) has no
         recorded outcome to serve. It is replayed as far as the journal goes:
@@ -537,6 +788,7 @@ class ReplayExecution(Execution):
                     "tool": recorded.tool,
                     "sequence": recorded.requested_sequence,
                     "call_id": recorded.call_id,
+                    "attempts": recorded.attempt_count,
                     "error": dict(recorded.error or {}),
                 }
             )
@@ -602,7 +854,20 @@ class ReplayExecution(Execution):
         return finalize_state(base)
 
     def _emit_open_call(self, recorded: RecordedToolCall) -> None:
-        """Re-emit the request and start of a call the journal never settled."""
+        """Re-emit exactly what the journal recorded for a call it never settled.
+
+        The normal loop cannot run this call -- its last attempt has no recorded
+        outcome to serve -- so the recorded prefix is put back event by event:
+        each attempt's start, then its outcome if one was recorded, then the
+        retry that failure scheduled. That matters for a call that was already
+        being retried when the crash hit: replaying only its last start would
+        silently drop the earlier failure and the retry that followed it, and
+        the replayed state would no longer match the original.
+
+        Nothing here is invented. The payloads are built by this code from the
+        recorded state; only the shape and the order are mirrored, and the
+        attempt the journal never resolved simply stops the walk.
+        """
         self._new_call_id()  # keep the recorded identity, as a settled call would
         self._append(
             EventType.TOOL_REQUESTED,
@@ -610,11 +875,86 @@ class ReplayExecution(Execution):
                 "call_id": recorded.call_id,
                 "tool": recorded.tool,
                 "arguments": dict(recorded.arguments),
+                "retry_policy": (
+                    recorded.retry_policy.to_dict()
+                    if recorded.retry_policy is not None
+                    else NO_RETRY.to_dict()
+                ),
             },
         )
+        for attempt in recorded.attempts:
+            self._append(
+                EventType.TOOL_STARTED,
+                {
+                    "call_id": recorded.call_id,
+                    "tool": recorded.tool,
+                    "attempt": attempt.attempt,
+                },
+            )
+            if not attempt.settled:
+                # The journal ends here: this attempt never got an outcome, and
+                # replay is not going to make one up for it.
+                break
+            self._emit_attempt_outcome(recorded, attempt)
+            if attempt.scheduled_retry is not None:
+                self._emit_scheduled_retry(recorded, attempt)
+
+    def _emit_attempt_outcome(
+        self, recorded: RecordedToolCall, attempt: RecordedAttempt
+    ) -> None:
+        """Re-emit one recorded attempt's outcome."""
+        payload: dict[str, Any] = {
+            "call_id": recorded.call_id,
+            "tool": recorded.tool,
+            "attempt": attempt.attempt,
+        }
+        if attempt.status is ToolCallStatus.COMPLETED:
+            self._append(EventType.TOOL_COMPLETED, {**payload, "result": attempt.result})
+        elif attempt.status is ToolCallStatus.CANCELLED:
+            self._append(EventType.TOOL_CANCELLED, {**payload, "error": dict(attempt.error or {})})
+        else:
+            self._append(EventType.TOOL_FAILED, {**payload, "error": dict(attempt.error or {})})
+
+    def _emit_scheduled_retry(
+        self, recorded: RecordedToolCall, attempt: RecordedAttempt
+    ) -> None:
+        """Re-emit the retry that a recorded attempt's failure scheduled."""
+        scheduled = attempt.scheduled_retry
+        assert scheduled is not None  # checked by the caller
         self._append(
-            EventType.TOOL_STARTED, {"call_id": recorded.call_id, "tool": recorded.tool}
+            EventType.TOOL_RETRY_SCHEDULED,
+            {
+                "call_id": recorded.call_id,
+                "tool": recorded.tool,
+                "attempt": scheduled.attempt,
+                "failed_attempt": scheduled.failed_attempt,
+                "delay": scheduled.delay,
+                "reason": scheduled.reason,
+                "error": dict(scheduled.error or {}),
+            },
         )
+
+    def _resolve_retry_policy(
+        self, name: str, call_policy: RetryPolicy | None
+    ) -> RetryPolicy:
+        """The policy the *recorded* call was journalled with.
+
+        A replay has no tool registry to consult, and re-deciding from a policy
+        this process happens to hold would be a second run rather than a
+        reproduction. The recorded ``ToolRequested`` is the answer, so the
+        replayed ``ToolRequested`` carries the same policy the original did.
+        """
+        if call_policy is not None:
+            return call_policy
+        if self._cursor < len(self._recorded):
+            return self._recorded[self._cursor].retry_policy or NO_RETRY
+        return NO_RETRY
+
+    def _append(self, event_type: EventType | str, payload: Mapping[str, Any]) -> Event:
+        """Journal one replayed event, counting the retries it reproduced."""
+        if EventType(event_type) is EventType.TOOL_RETRY_SCHEDULED:
+            self._retries += 1
+        return super()._append(event_type, payload)
 
     def _prepare_request(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> ToolRequest:
         """Normalize the call the way the *original* run did: from the journal.
@@ -666,6 +1006,8 @@ class ReplayExecution(Execution):
             error=recorded.error if exc is not None else None,
             # The whole point: nothing was executed, only looked up.
             executed=False,
+            attempt=max(recorded.attempt_count, 1),
+            attempts=max(recorded.attempt_count, 1),
         )
         self._steps.append(step)
         if self._on_step is not None:
@@ -714,6 +1056,10 @@ class ReplayResult:
     steps: tuple[ReplayStep, ...] = ()
     journal_unchanged: bool = True
     errors: tuple[Mapping[str, Any], ...] = ()
+    #: How many ``ToolRetryScheduled`` events this replay reproduced, and the
+    #: backoff waits they carried -- reproduced from the journal, never spent.
+    retries_replayed: int = 0
+    delays_replayed: tuple[float, ...] = ()
 
     # The spec's example reads ``replayed.state``; keep both names working.
     @property
@@ -741,6 +1087,8 @@ class ReplayResult:
             "duration": round(self.duration, 6),
             "from_sequence": self.from_sequence,
             "journal_unchanged": self.journal_unchanged,
+            "retries_replayed": self.retries_replayed,
+            "delays_replayed": list(self.delays_replayed),
             "original_state": self.original_state.to_dict(),
             "final_state": self.final_state.to_dict(),
             "steps": [step.to_dict() for step in self.steps],
@@ -758,6 +1106,11 @@ class ReplayResult:
         ]
         if self.from_sequence:
             lines.append(f"Resumed from sequence: {self.from_sequence}")
+        if self.retries_replayed:
+            lines.append(
+                f"Retries replayed: {self.retries_replayed} "
+                f"(delays: {list(self.delays_replayed)})"
+            )
         if not self.journal_unchanged:
             lines.append("Original journal: MUTATED")
         lines.extend(
@@ -859,7 +1212,11 @@ class ReplayEngine:
 
         original_state = reconstruct_state(self.journal.get_events(self.execution_id))
         base_state = self._base_state()
-        recorded = RecordedToolCall.recorded_from(original_state, since=self.from_sequence)
+        recorded = RecordedToolCall.recorded_from(
+            original_state,
+            since=self.from_sequence,
+            policies=self._recorded_policies(),
+        )
         mirror = self.journal.get_events_from(self.execution_id, self.from_sequence)
 
         self._original_state = original_state
@@ -919,6 +1276,8 @@ class ReplayEngine:
             steps=execution.steps,
             journal_unchanged=events_before == events_after,
             errors=execution.errors,
+            retries_replayed=execution.retries_replayed,
+            delays_replayed=tuple(execution.delays_replayed),
         )
         self._assert_matched(result)
         return result
@@ -975,6 +1334,24 @@ class ReplayEngine:
                         received={"payload": dict(event.payload)},
                     )
                 execution.replay_recorded_call(call)
+
+    def _recorded_policies(self) -> dict[str, Any]:
+        """The retry policy each call was journalled with, keyed by ``call_id``.
+
+        Read straight out of the recorded ``ToolRequested`` events, so the
+        replayed journal carries the policy the original ran under even when the
+        replaying process registers different tools -- or none at all.
+        """
+        policies: dict[str, Any] = {}
+        for event in self.journal.get_events(self.execution_id):
+            if (
+                event.event_type is EventType.TOOL_REQUESTED
+                and event.sequence > self.from_sequence
+            ):
+                policies[str(event.payload.get("call_id"))] = event.payload.get(
+                    "retry_policy"
+                )
+        return policies
 
     def _state_at(self, sequence: int) -> ExecutionState:
         """The state this execution's history describes at ``sequence``.

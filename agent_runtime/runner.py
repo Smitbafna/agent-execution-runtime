@@ -12,6 +12,12 @@ recorded. Because replay dispatches through this same object, the guarantee is
 structural -- a replay has no code path that reaches a tool function, so a
 ``create_github_issue`` cannot run twice no matter what the caller does.
 
+Milestone 4A adds three seams here -- :meth:`ToolRunner.begin_call`,
+:meth:`ToolRunner.can_attempt` and :meth:`ToolRunner.retry_decision` -- for the
+same reason. NORMAL answers them from the live tool plus the call's policy; the
+REPLAY runner answers them from the recorded attempt history, so a replayed
+retry is the retry that was journalled rather than one the replay re-decides.
+
 Scope note: replay substitutes *recorded* tool results. It does not sandbox or
 intercept anything else -- ``time``, ``random``, the network and environment
 variables are external inputs an execution must treat as tools if they influence
@@ -26,6 +32,7 @@ from typing import Any, Mapping
 
 from .events import describe_error
 from .exceptions import ToolInvocationError
+from .retry import RetryDecision, RetryPolicy
 from .state import ToolCallStatus
 from .tools import ToolRegistry, make_jsonable
 
@@ -105,9 +112,10 @@ class ToolRunner:
     def run(self, request: ToolRequest) -> ToolOutcome:
         """Invoke the registered tool and return what it produced.
 
-        A tool that raises is an outcome, not an exception escaping this method:
-        the caller journals ``ToolFailed`` from it and then re-raises, so the
-        failure is durable before anything observes it.
+        One call, one attempt. A tool that raises is an outcome, not an
+        exception escaping this method: the caller journals ``ToolFailed`` from
+        it, decides about a retry, and only then re-raises, so both the failure
+        and any decision about it are durable before anything observes them.
         """
         target = self.registry.get(request.tool)
         bound = target.bind((), request.arguments)
@@ -115,6 +123,58 @@ class ToolRunner:
             return ToolOutcome.completed(make_jsonable(target.invoke(bound)))
         except Exception as exc:  # noqa: BLE001 - the failure itself is the outcome
             return ToolOutcome.failed_with(exc)
+
+    # -- retry seams ----------------------------------------------------------
+
+    def begin_call(self, call_id: str, request: ToolRequest) -> None:
+        """A logical call is starting its first attempt.
+
+        The NORMAL runner has nothing to bind -- the tool is simply there when
+        it is run. The hook exists so the REPLAY runner can attach the recorded
+        call to the execution, instead of counting calls positionally and
+        hoping the two orders agree.
+        """
+
+    def can_attempt(self, call_id: str, attempt: int) -> bool:
+        """Whether attempt ``attempt`` may be run.
+
+        Always ``True`` for a real call: attempts are limited by the policy, not
+        by the journal. A replay asks instead of assuming, because a history
+        that ends after ``ToolRetryScheduled`` has nothing recorded for the
+        attempt that was scheduled, and inventing one is what replay must never
+        do.
+        """
+        return True
+
+    def retry_decision(
+        self,
+        request: ToolRequest,
+        outcome: ToolOutcome,
+        *,
+        call_id: str,
+        attempt: int,
+        policy: RetryPolicy,
+    ) -> RetryDecision | None:
+        """Whether the attempt that just failed should be followed by another.
+
+        This is the only place a retry is decided in a real run, and it is
+        decided from the live exception plus the policy -- never from a guess
+        about how transient the failure looks.
+
+        Returns:
+            A :class:`~agent_runtime.retry.RetryDecision` to carry out, or
+            ``None`` to let the failure stand.
+        """
+        error = outcome.cause
+        if not policy.should_retry(error, attempt):
+            return None
+        return RetryDecision(
+            attempt=attempt + 1,
+            failed_attempt=attempt,
+            delay=policy.delay(attempt),
+            reason=str(policy.classify(error)),
+            error=dict(outcome.error or {}),
+        )
 
     def invocation_error(
         self, request: ToolRequest, outcome: ToolOutcome

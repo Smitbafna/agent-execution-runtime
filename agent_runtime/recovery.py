@@ -33,7 +33,10 @@ from .state import (
     ExecutionState,
     ExecutionStatus,
     IncompleteTool,
+    PendingRetry,
     apply_event,
+    detect_incomplete_tools,
+    detect_pending_retries,
     finalize_state,
     reconstruct_state,
 )
@@ -64,15 +67,28 @@ class RecoveryInfo:
     checkpoint_id: str | None = None
     events_after_checkpoint: int = 0
     incomplete_tools: tuple[IncompleteTool, ...] = ()
+    pending_retries: tuple[PendingRetry, ...] = ()
 
     @property
     def needs_resolution(self) -> bool:
         """True when the history left tool work with no recorded outcome.
 
-        Milestone 2 stops here on purpose: the decision of whether to retry,
-        resume or mark the call failed belongs to the application.
+        Milestone 2 stopped here on purpose, and Milestone 4A did not move the
+        line: a retry policy repeats *recorded failures*, never work whose
+        outcome the journal does not know. Whether to retry, resume or mark such
+        a call failed still belongs to the application.
         """
         return bool(self.incomplete_tools)
+
+    @property
+    def has_pending_retries(self) -> bool:
+        """True when the journal scheduled retries that never started.
+
+        The opposite of :attr:`needs_resolution`: nothing here needs a decision,
+        each scheduled attempt is simply the next thing to do (see
+        :meth:`~agent_runtime.execution.Execution.continue_pending_retry`).
+        """
+        return bool(self.pending_retries)
 
     @property
     def events_replayed(self) -> int:
@@ -91,6 +107,7 @@ class RecoveryInfo:
             "events_replayed": self.events_replayed,
             "needs_resolution": self.needs_resolution,
             "incomplete_tools": [item.to_dict() for item in self.incomplete_tools],
+            "pending_retries": [item.to_dict() for item in self.pending_retries],
         }
 
     def __str__(self) -> str:
@@ -120,8 +137,22 @@ class RecoveryInfo:
                     lines.append(f"    {key}={value!r}")
             lines.append("")
             lines.append(
-                "This runtime does not retry automatically: resolve these with "
-                "execution.resolve_recovery(...), or fail/cancel the execution."
+                "These calls have no recorded outcome, so no retry policy applies to "
+                "them: resolve them with execution.resolve_recovery(...), or "
+                "fail/cancel the execution."
+            )
+
+        if self.pending_retries:
+            lines.append("")
+            lines.append("Scheduled retries:")
+            for retry in self.pending_retries:
+                lines.append("")
+                lines.append(f"    {retry}")
+                lines.append(f"    recorded at sequence: {retry.sequence}")
+            lines.append("")
+            lines.append(
+                "These are decisions, not ambiguities: carry them on with "
+                "execution.continue_pending_retry(call_id)."
             )
         return "\n".join(lines)
 
@@ -175,6 +206,7 @@ def recover_execution(
             last_sequence=last_sequence,
             events_after_checkpoint=last_sequence,
             incomplete_tools=state.incomplete_tools,
+            pending_retries=detect_pending_retries(state),
         )
 
     if checkpoint.sequence > last_sequence:
@@ -200,4 +232,5 @@ def recover_execution(
         checkpoint_id=checkpoint.checkpoint_id,
         events_after_checkpoint=len(tail),
         incomplete_tools=state.incomplete_tools,
+        pending_retries=detect_pending_retries(state),
     )

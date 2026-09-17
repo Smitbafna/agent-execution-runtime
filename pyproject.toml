@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-execution-runtime"
-version = "0.3.0"
-description = "A durable, event-sourced execution runtime for AI agents (Milestone 3: deterministic replay)"
+version = "0.4.0"
+description = "A durable, event-sourced execution runtime for AI agents (Milestone 4A: retries and attempt semantics)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-keywords = ["event-sourcing", "journal", "checkpoints", "recovery", "agents", "runtime", "durability"]
+keywords = [
+    "event-sourcing", "journal", "checkpoints", "recovery", "retries",
+    "backoff", "agents", "runtime", "durability",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",

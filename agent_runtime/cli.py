@@ -81,8 +81,11 @@ def _cmd_replay(runtime: Runtime, args: argparse.Namespace, out: TextIO) -> int:
 
     def report(step: ReplayStep) -> None:
         # A recorded failure is marked as such: it was served from the journal
-        # too, just an unsuccessful outcome rather than a result.
-        print(f"  {'✓' if step.succeeded else '✗'} {step.tool}", file=out)
+        # too, just an unsuccessful outcome rather than a result. A call that
+        # the journal shows being retried says which attempt finally settled it.
+        mark = "✓" if step.succeeded else "✗"
+        attempts = f" (attempt {step.attempt}/{step.attempts})" if step.retried else ""
+        print(f"  {mark} {step.tool}{attempts}", file=out)
 
     if as_json:
         # In JSON mode the output has to be nothing but JSON, so the progress
@@ -123,6 +126,14 @@ def _cmd_replay(runtime: Runtime, args: argparse.Namespace, out: TextIO) -> int:
     print(file=out)
     print(f"Events replayed: {result.events_replayed}", file=out)
     print(f"Tools replayed: {result.tools_replayed}", file=out)
+    if result.retries_replayed:
+        # A retried call is still one tool call; the attempts and the backoff it
+        # waited are what say so.
+        print(
+            f"Retries replayed: {result.retries_replayed} "
+            f"(delays: {list(result.delays_replayed)})",
+            file=out,
+        )
     if result.from_sequence:
         print(f"Resumed from sequence: {result.from_sequence}", file=out)
     print(f"State: {result.status}", file=out)

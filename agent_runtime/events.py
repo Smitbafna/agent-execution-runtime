@@ -41,6 +41,11 @@ class EventType(StrEnum):
     TOOL_STARTED = "ToolStarted"
     TOOL_COMPLETED = "ToolCompleted"
     TOOL_FAILED = "ToolFailed"
+    #: The decision to run one more attempt, recorded *before* the wait and
+    #: before the attempt itself. Durable: a process that dies during the
+    #: backoff leaves the scheduled retry visible in the journal rather than
+    #: only in the memory of the process that was about to sleep.
+    TOOL_RETRY_SCHEDULED = "ToolRetryScheduled"
     TOOL_CANCELLED = "ToolCancelled"
 
 
@@ -200,5 +205,7 @@ _TOOL_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.TOOL_STARTED,
         EventType.TOOL_COMPLETED,
         EventType.TOOL_FAILED,
+        EventType.TOOL_RETRY_SCHEDULED,
+        EventType.TOOL_CANCELLED,
     }
 )

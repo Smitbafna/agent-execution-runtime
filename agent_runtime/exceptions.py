@@ -29,6 +29,9 @@ __all__ = [
     "ToolCallError",
     "ToolArgumentError",
     "ToolInvocationError",
+    "RetryableToolError",
+    "PermanentToolError",
+    "RetryConfigurationError",
     "UnknownToolCallError",
     "InvalidRecoveryActionError",
     "StateReconstructionError",
@@ -123,12 +126,16 @@ class ToolCallError(AgentRuntimeError):
         call_id: str | None = None,
         error_type: str | None = None,
         traceback_text: str | None = None,
+        attempts: int | None = None,
     ) -> None:
         super().__init__(message)
         self.tool_name = tool_name
         self.call_id = call_id
         self.error_type = error_type or type(self).__name__
         self.traceback_text = traceback_text
+        #: How many attempts the logical call made before failing (Milestone 4A).
+        #: ``None`` for failures that are not about a tool call at all.
+        self.attempts = attempts
 
 
 class ToolArgumentError(ToolCallError):
@@ -140,6 +147,33 @@ class ToolInvocationError(ToolCallError):
 
     The original exception is always chained with ``raise ... from error`` and
     its traceback is stored on the instance.
+    """
+
+
+class RetryableToolError(ToolError):
+    """A tool failure that a retry may fix -- a timeout, a rate limit, a 503.
+
+    Raising this is how a tool says "this attempt failed, and running it again
+    is worth doing". It is the *only* thing that makes an attempt eligible for
+    an automatic retry; nothing is inferred from the exception's message, its
+    type or how transient it looks.
+    """
+
+
+class PermanentToolError(ToolError):
+    """A tool failure that repeating the attempt cannot fix.
+
+    A validation failure, a missing record, a rejected request. Retrying it
+    would only burn time, so the runtime never does, whatever the policy says.
+    """
+
+
+class RetryConfigurationError(AgentRuntimeError):
+    """A retry policy or a retry-related argument is not usable.
+
+    Raised while a policy is being defined rather than while a tool is running:
+    an impossible ``max_attempts`` or a backoff that is not a policy is a
+    programming error, and finding it out at call time would be too late.
     """
 
 
