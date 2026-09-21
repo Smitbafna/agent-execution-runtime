@@ -56,6 +56,7 @@ from .exceptions import (
     ToolInvocationError,
 )
 from .execution import Execution
+from .idempotency import ReplayIdempotencyGuard
 from .journal import EventJournal
 from .retry import NO_RETRY, RecordingSleeper, RetryDecision, RetryPolicy, Sleeper
 from .runner import ToolOutcome, ToolRequest, ToolRunner, ToolRunnerMode
@@ -165,6 +166,16 @@ class RecordedToolCall:
     attempts: tuple[RecordedAttempt, ...] = ()
     scheduled_retry: PendingRetry | None = None
     retry_policy: RetryPolicy | None = None
+    #: The idempotency key the original call was made under (Milestone 4B), or
+    #: ``None`` for a call that had none. Carried so a replay re-emits it and can
+    #: reject a replay that uses a different one.
+    idempotency_key: str | None = None
+    #: True when the original call was answered from the idempotency store
+    #: instead of running its tool. Not part of :class:`~agent_runtime.state.ToolCall`
+    #: -- the reconstructed call looks like any completed call -- so it is read
+    #: straight out of the recorded ``ToolRequested`` payload, the same way the
+    #: retry policy is.
+    deduplicated: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -205,6 +216,8 @@ class RecordedToolCall:
                 None if self.scheduled_retry is None else self.scheduled_retry.to_dict()
             ),
             "retry_policy": None if self.retry_policy is None else self.retry_policy.to_dict(),
+            "idempotency_key": self.idempotency_key,
+            "deduplicated": self.deduplicated,
         }
 
     @classmethod
@@ -231,6 +244,7 @@ class RecordedToolCall:
                 for item in call.attempts
             ),
             scheduled_retry=call.pending_retry,
+            idempotency_key=call.idempotency_key,
         )
 
     @classmethod
@@ -240,26 +254,34 @@ class RecordedToolCall:
         *,
         since: int = 0,
         policies: Mapping[str, Any] | None = None,
+        deduplicated: Mapping[str, bool] | None = None,
     ) -> tuple["RecordedToolCall", ...]:
         """Every tool call at or after ``since``, which a replay must reproduce.
 
         ``policies`` optionally supplies each call's journalled retry policy
         (keyed by ``call_id``), so a replay re-emits ``ToolRequested`` with the
         policy the original ran under instead of the one it happens to have in
-        this process.
+        this process. ``deduplicated`` says, the same way, which recorded calls
+        were answered from the idempotency store instead of being run (Milestone
+        4B) -- so the replay reproduces *those* as settled-without-running too.
         """
-        calls = (
+        calls = tuple(
             cls.from_tool_call(call, index)
             for index, call in enumerate(
                 call for call in state.tool_calls if call.requested_sequence > since
             )
         )
-        if not policies:
-            return tuple(calls)
-        return tuple(
-            replace(call, retry_policy=RetryPolicy.from_dict(policies.get(call.call_id)))
-            for call in calls
-        )
+        if policies:
+            calls = tuple(
+                replace(call, retry_policy=RetryPolicy.from_dict(policies.get(call.call_id)))
+                for call in calls
+            )
+        if deduplicated:
+            calls = tuple(
+                replace(call, deduplicated=bool(deduplicated.get(call.call_id)))
+                for call in calls
+            )
+        return calls
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +683,9 @@ class ReplayExecution(Execution):
 
     * the journal is in memory, so replaying cannot modify the original history;
     * the tool runner is :class:`ReplayToolRunner`, so no tool function runs;
+    * the idempotency guard is :class:`ReplayIdempotencyGuard`, which has no
+      store behind it -- a replay cannot claim a key, insert a ``PENDING``
+      record, overwrite a result, or even look one up (Milestone 4B);
     * calls are normalized against the *recorded* call, so a replay works even
       when the tool function no longer exists or no longer has that signature.
 
@@ -691,6 +716,7 @@ class ReplayExecution(Execution):
             execution_id,
             runner=runner,
             sleeper=sleeper if sleeper is not None else RecordingSleeper(),
+            idempotency=ReplayIdempotencyGuard(recorded),
         )  # type: ignore[arg-type]
         self._replay_runner = runner
         self._recorded = recorded
@@ -750,9 +776,35 @@ class ReplayExecution(Execution):
         path validates arguments before it writes ``ToolRequested``. A mismatch
         therefore leaves the replay exactly as it was -- no half-written call, no
         advanced cursor -- instead of half-applying a call it then rejects.
+
+        The idempotency key is lifted out of ``kwargs`` first: it is part of how a
+        call is *made*, not one of its arguments, so it must not leak into the
+        recorded ``arguments`` the request is checked against. It is then compared
+        with the key the journal recorded -- replaying a call under a different
+        key is a divergence, and reporting it is the whole point.
         """
+        idempotency_key = kwargs.pop("idempotency_key", None)
+        kwargs.pop("retry_policy", None)
+        self._check_recorded_key(idempotency_key)
         self._replay_runner.check(self._prepare_request(name, args, kwargs))
-        return super().call(name, *args, **kwargs)
+        return super().call(name, *args, idempotency_key=idempotency_key, **kwargs)
+
+    def _check_recorded_key(self, idempotency_key: str | None) -> None:
+        """Reject a replay whose key is not the one the journal recorded."""
+        if self._cursor >= len(self._recorded):
+            return  # nothing recorded here to disagree with
+        recorded = self._recorded[self._cursor]
+        if recorded.idempotency_key == idempotency_key:
+            return
+        raise ReplayMismatchError(
+            f"replay called {recorded.tool!r} with idempotency key "
+            f"{idempotency_key!r} but the journal recorded {recorded.idempotency_key!r}",
+            kind="arguments",
+            execution_id=self.id,
+            sequence=recorded.requested_sequence,
+            expected={"idempotency_key": recorded.idempotency_key},
+            received={"idempotency_key": idempotency_key},
+        )
 
     def replay_recorded_call(self, recorded: RecordedToolCall) -> Any:
         """Replay one recorded call by name and arguments, returning its result.
@@ -777,7 +829,11 @@ class ReplayExecution(Execution):
             return None
 
         try:
-            result = self.call(recorded.tool, **dict(recorded.arguments))
+            result = self.call(
+                recorded.tool,
+                **dict(recorded.arguments),
+                idempotency_key=recorded.idempotency_key,
+            )
         except ToolInvocationError as exc:
             self._record_step(recorded, exc)
             # The original execution survived this failure (it went on to call
@@ -869,19 +925,19 @@ class ReplayExecution(Execution):
         attempt the journal never resolved simply stops the walk.
         """
         self._new_call_id()  # keep the recorded identity, as a settled call would
-        self._append(
-            EventType.TOOL_REQUESTED,
-            {
-                "call_id": recorded.call_id,
-                "tool": recorded.tool,
-                "arguments": dict(recorded.arguments),
-                "retry_policy": (
-                    recorded.retry_policy.to_dict()
-                    if recorded.retry_policy is not None
-                    else NO_RETRY.to_dict()
-                ),
-            },
-        )
+        payload: dict[str, Any] = {
+            "call_id": recorded.call_id,
+            "tool": recorded.tool,
+            "arguments": dict(recorded.arguments),
+            "retry_policy": (
+                recorded.retry_policy.to_dict()
+                if recorded.retry_policy is not None
+                else NO_RETRY.to_dict()
+            ),
+        }
+        if recorded.idempotency_key is not None:
+            payload["idempotency_key"] = recorded.idempotency_key
+        self._append(EventType.TOOL_REQUESTED, payload)
         for attempt in recorded.attempts:
             self._append(
                 EventType.TOOL_STARTED,
@@ -1216,6 +1272,7 @@ class ReplayEngine:
             original_state,
             since=self.from_sequence,
             policies=self._recorded_policies(),
+            deduplicated=self._recorded_deduplicated(),
         )
         mirror = self.journal.get_events_from(self.execution_id, self.from_sequence)
 
@@ -1342,16 +1399,30 @@ class ReplayEngine:
         replayed journal carries the policy the original ran under even when the
         replaying process registers different tools -- or none at all.
         """
-        policies: dict[str, Any] = {}
+        return self._recorded_request_field("retry_policy")
+
+    def _recorded_deduplicated(self) -> dict[str, bool]:
+        """Which recorded calls the idempotency store answered, keyed by ``call_id``.
+
+        A deduplicated call has no ``ToolStarted`` in its history -- the tool
+        never ran -- so the flag is what lets the replay reproduce that shape
+        instead of inventing an attempt (Milestone 4B).
+        """
+        return {
+            call_id: bool(payload)
+            for call_id, payload in self._recorded_request_field("deduplicated").items()
+        }
+
+    def _recorded_request_field(self, field: str) -> dict[str, Any]:
+        """One field of every recorded ``ToolRequested`` payload, keyed by ``call_id``."""
+        recorded: dict[str, Any] = {}
         for event in self.journal.get_events(self.execution_id):
             if (
                 event.event_type is EventType.TOOL_REQUESTED
                 and event.sequence > self.from_sequence
             ):
-                policies[str(event.payload.get("call_id"))] = event.payload.get(
-                    "retry_policy"
-                )
-        return policies
+                recorded[str(event.payload.get("call_id"))] = event.payload.get(field)
+        return recorded
 
     def _state_at(self, sequence: int) -> ExecutionState:
         """The state this execution's history describes at ``sequence``.

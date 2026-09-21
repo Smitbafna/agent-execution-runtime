@@ -14,6 +14,13 @@ truth: a checkpoint that cannot be read back is reported, never ignored.
 
 Nothing here retries, replays deterministically or branches. The most this
 module does is *say* what a crash left unfinished, through :class:`RecoveryInfo`.
+
+Milestone 4B adds a second thing a crash can leave unfinished, which does not
+live in the journal at all: an idempotency key that was claimed before the tool
+ran and never got an outcome. Recovery reports those too
+(:attr:`RecoveryInfo.pending_idempotency`) rather than letting them hide behind
+a clean-looking history -- an execution whose last event is ``ToolRequested`` can
+still be the one whose payment already went through.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from .exceptions import (
     ExecutionNotFoundError,
     StateReconstructionError,
 )
+from .idempotency import IdempotencyGuard, IdempotencyRecord, unresolved_records
 from .journal import EventJournal
 from .state import (
     ExecutionState,
@@ -68,6 +76,10 @@ class RecoveryInfo:
     events_after_checkpoint: int = 0
     incomplete_tools: tuple[IncompleteTool, ...] = ()
     pending_retries: tuple[PendingRetry, ...] = ()
+    #: Idempotency keys this execution claimed and never settled (Milestone 4B).
+    #: Read from the idempotency store, not from the journal: a key can be left
+    #: ``PENDING`` by a crash that left no ambiguous tool call behind at all.
+    pending_idempotency: tuple[IdempotencyRecord, ...] = ()
 
     @property
     def needs_resolution(self) -> bool:
@@ -79,6 +91,16 @@ class RecoveryInfo:
         a call failed still belongs to the application.
         """
         return bool(self.incomplete_tools)
+
+    @property
+    def needs_idempotency_resolution(self) -> bool:
+        """True when an idempotency key is unresolved (Milestone 4B).
+
+        The other half of "this crash left something unresolved", and the one
+        that survives a perfectly clean journal: the side effect may already have
+        happened even though every recorded event looks fine.
+        """
+        return bool(unresolved_records(self.pending_idempotency))
 
     @property
     def has_pending_retries(self) -> bool:
@@ -108,6 +130,10 @@ class RecoveryInfo:
             "needs_resolution": self.needs_resolution,
             "incomplete_tools": [item.to_dict() for item in self.incomplete_tools],
             "pending_retries": [item.to_dict() for item in self.pending_retries],
+            "needs_idempotency_resolution": self.needs_idempotency_resolution,
+            "pending_idempotency": [
+                record.to_dict() for record in self.pending_idempotency
+            ],
         }
 
     def __str__(self) -> str:
@@ -154,6 +180,23 @@ class RecoveryInfo:
                 "These are decisions, not ambiguities: carry them on with "
                 "execution.continue_pending_retry(call_id)."
             )
+
+        if self.pending_idempotency:
+            lines.append("")
+            lines.append("Unresolved idempotency keys:")
+            for record in self.pending_idempotency:
+                lines.append("")
+                lines.append(f"    {record}")
+                if record.is_unresolved:
+                    lines.append(f"    claimed at: {record.created_at}")
+                    lines.append(f"    tool: {record.tool_name}({record.call_id})")
+            lines.append("")
+            lines.append(
+                "A PENDING key means the runtime committed the intent to run the "
+                "side effect and never recorded an outcome -- the process may have "
+                "died between the two. It will not run the tool again on its own; "
+                "settle each key with execution.resolve_idempotency(key, ...)."
+            )
         return "\n".join(lines)
 
 
@@ -178,13 +221,23 @@ def apply_events_from(
 
 
 def recover_execution(
-    journal: EventJournal, checkpoints: CheckpointStore, execution_id: str
+    journal: EventJournal,
+    checkpoints: CheckpointStore,
+    execution_id: str,
+    *,
+    idempotency: IdempotencyGuard | None = None,
 ) -> RecoveryInfo:
     """Rebuild an execution's current state, starting from its latest checkpoint.
 
     The checkpoint is only ever a shortcut over events that are still there: the
     events after it are read from the journal and applied on top, so the result
     is always "checkpoint + durable events" and never "checkpoint as-is".
+
+    ``idempotency`` supplies the claims to report alongside (Milestone 4B).
+    Leaving it out reports none -- which is what a caller that has no
+    idempotency store (a replay) wants. Note what recovery does *not* do with
+    them: a ``PENDING`` key is reported, never executed, because "was it
+    claimed" is not "did it happen".
 
     Raises:
         ExecutionNotFoundError: the execution has no events at all.
@@ -195,18 +248,22 @@ def recover_execution(
         raise ExecutionNotFoundError(f"No journal found for execution {execution_id!r}")
 
     checkpoint = checkpoints.get_latest(execution_id)
+    pending_keys: tuple[IdempotencyRecord, ...] = (
+        () if idempotency is None else idempotency.pending_records(execution_id)
+    )
 
     if checkpoint is None:
         state = reconstruct_state(journal.get_events(execution_id))
         return RecoveryInfo(
             execution_id=execution_id,
-            status=state.status,
+            status=_status_with_keys(state.status, pending_keys),
             source="events",
             state=state,
             last_sequence=last_sequence,
             events_after_checkpoint=last_sequence,
             incomplete_tools=state.incomplete_tools,
             pending_retries=detect_pending_retries(state),
+            pending_idempotency=pending_keys,
         )
 
     if checkpoint.sequence > last_sequence:
@@ -224,7 +281,7 @@ def recover_execution(
     )
     return RecoveryInfo(
         execution_id=execution_id,
-        status=state.status,
+        status=_status_with_keys(state.status, pending_keys),
         source="checkpoint",
         state=state,
         last_sequence=last_sequence,
@@ -233,4 +290,21 @@ def recover_execution(
         events_after_checkpoint=len(tail),
         incomplete_tools=state.incomplete_tools,
         pending_retries=detect_pending_retries(state),
+        pending_idempotency=pending_keys,
     )
+
+
+def _status_with_keys(
+    status: ExecutionStatus, pending_keys: tuple[IdempotencyRecord, ...]
+) -> ExecutionStatus:
+    """Report ``RECOVERY_REQUIRED`` when an unresolved key joins an open status.
+
+    The journal-derived status is only upgraded, never downgraded: a deliberate
+    ``COMPLETED``/``FAILED``/``CANCELLED`` stays, exactly as
+    :func:`~agent_runtime.state.resolve_status` decided. What is added is the
+    case the journal cannot see at all -- a side effect that may have happened
+    with nothing in the history saying so.
+    """
+    if status is ExecutionStatus.RUNNING and unresolved_records(pending_keys):
+        return ExecutionStatus.RECOVERY_REQUIRED
+    return status

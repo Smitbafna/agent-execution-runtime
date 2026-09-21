@@ -252,6 +252,13 @@ class ToolCall:
     attempts: tuple[ToolAttempt, ...] = ()
     #: A retry the journal recorded but had not started yet, if any.
     pending_retry: PendingRetry | None = None
+    #: The idempotency key this call was made under, if any (Milestone 4B).
+    #:
+    #: Journalled with ``ToolRequested`` and never changed afterwards, so a
+    #: deduplicated call -- one the idempotency store answered without running
+    #: the tool -- is visible in the reconstructed state exactly like any other
+    #: call, and a replay reproduces the same field.
+    idempotency_key: str | None = None
 
     @property
     def attempt_count(self) -> int:
@@ -291,6 +298,7 @@ class ToolCall:
             "attempt": self.attempt,
             "attempts": [item.to_dict() for item in self.attempts],
             "pending_retry": None if self.pending_retry is None else self.pending_retry.to_dict(),
+            "idempotency_key": self.idempotency_key,
         }
 
     @classmethod
@@ -312,6 +320,7 @@ class ToolCall:
                 ToolAttempt.from_dict(item) for item in data.get("attempts") or ()
             ),
             pending_retry=None if pending is None else PendingRetry.from_dict(pending),
+            idempotency_key=data.get("idempotency_key"),
         )
 
 
@@ -527,6 +536,10 @@ def _on_tool_requested(state: ExecutionState, event: Event) -> ExecutionState:
         arguments=event.payload.get("arguments") or {},
         status=ToolCallStatus.REQUESTED,
         requested_sequence=event.sequence,
+        # Milestone 4B: the key is fixed here, for the whole logical call and
+        # therefore for every one of its attempts. Journals written before it
+        # carry no key, and the field simply stays None.
+        idempotency_key=event.payload.get("idempotency_key"),
     )
     return replace(state, execution_id=event.execution_id, tool_calls=state.tool_calls + (call,))
 

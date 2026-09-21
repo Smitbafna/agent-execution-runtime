@@ -12,7 +12,7 @@ It also supports deterministic replay, retries, idempotency, and eventually time
 * [x] Deterministic execution replay
 * [x] Checkpoints and state reconstruction
 * [x] Tool retries with exponential backoff
-* [ ] Idempotent tool execution
+* [x] Idempotent tool execution
 * [ ] Tool timeouts and cancellation
 * [ ] Execution inspection and debugging
 * [ ] Time-travel debugging
@@ -45,6 +45,191 @@ pip install -e .
 ```bash
 agent-runtime --help
 ```
+
+## Milestone 4B: idempotency & crash-safe side effects
+
+The invariant this milestone is built around:
+
+> A side-effecting tool never runs twice for one idempotency key unless the
+> application explicitly asks for it, and every key whose outcome the runtime
+> does not know is reported rather than guessed at.
+
+### The problem
+
+```text
+execution.call("send_email", ..., idempotency_key="email-123")
+    |
+    +-- claim the key                 committed to SQLite
+    +-- the email is sent             outside SQLite, not undoable
+    +-- store the outcome             <-- the process dies HERE
+    |
+    +-- recovery: "did the email go out?"
+```
+
+The claim commits and the side effect happens in different systems, and **no
+implementation can make those two writes atomic**:
+
+```text
+BEGIN
+<external API call>     <-- not in the transaction, not reversible
+INSERT outcome
+COMMIT
+```
+
+If the answer were assumed to be "no", every recovery would send the email
+again. If it were assumed to be "yes", a crash *before* the request would lose
+it. Neither is knowledge. So this milestone does not offer exactly-once
+execution — it offers a durable claim, a visible ambiguity, and an explicit
+decision.
+
+### Using it
+
+```python
+execution.call(
+    "send_email",
+    to="user@example.com",
+    body="hello",
+    idempotency_key="welcome-user-123",   # names the intended side effect
+)
+
+execution.call(
+    "send_email",
+    to="user@example.com",
+    body="hello",
+    idempotency_key="welcome-user-123",   # returns the stored result,
+)                                         # does NOT send again
+
+runtime.idempotency_record("welcome-user-123")
+# IdempotencyRecord(status=COMPLETED, result={'message_id': 'msg-1'}, attempts=1)
+```
+
+The lifecycle of a key:
+
+```text
+no record  -> claim -> PENDING -> tool runs -> COMPLETED / FAILED
+                                     ^
+                                     |  a crash here leaves it here
+```
+
+| | key state | what `call` does |
+| --- | --- | --- |
+| first use | *no record* | claims the key, runs the tool, stores the outcome |
+| duplicate | `COMPLETED` | returns the stored result, **runs nothing** |
+| after a crash | `PENDING` | raises `IdempotencyRecoveryRequiredError` |
+| after a recorded failure | `FAILED` | raises `IdempotencyKeyFailedError` |
+| after `resolve_idempotency(..., "retry")` | `PENDING` + authorized | runs the tool, once |
+
+### After a crash
+
+```python
+with Runtime("agent.db") as runtime:
+    execution = runtime.resume(execution_id)
+
+    execution.status                   # RECOVERY_REQUIRED
+    execution.unresolved_idempotency   # the keys it cannot answer for
+    execution.recovery_info()          # the journal's view, plus those keys
+
+    # "I checked the provider: it really was sent."
+    execution.resolve_idempotency(
+        "welcome-user-123", action="mark_completed", result={"message_id": "msg-1"}
+    )
+    # or: "it did not go out, send it again"
+    execution.resolve_idempotency("welcome-user-123", action="retry")
+    # or: "it definitely did not happen"
+    execution.resolve_idempotency("welcome-user-123", action="mark_failed", error="...")
+
+    execution.complete()          # ...and only now can the execution close
+```
+
+An execution with an unresolved key reports `RECOVERY_REQUIRED` and cannot be
+completed — closing out an execution whose side effect is of unknown outcome
+would hide the very thing the key exists to expose. `fail()` and
+`mark_cancelled()` remain available, because giving up *is* a decision.
+
+```
+Execution: exec_123
+Status: RECOVERY_REQUIRED
+...
+Unresolved idempotency keys:
+
+    welcome-user-123 [PENDING] send_email(call_456) claimed by exec_123 (attempt 1, outcome unknown)
+    claimed at: 2026-04-01T10:00:03+00:00
+    tool: send_email(call_456)
+
+A PENDING key means the runtime committed the intent to run the side effect and
+never recorded an outcome -- the process may have died between the two. It will
+not run the tool again on its own; settle each key with
+execution.resolve_idempotency(key, ...).
+```
+
+`retry` is deliberately **one** authorization, not a standing permission: the
+record stays `PENDING` (nobody has said the effect happened) and the next claim
+consumes it. A second call without another `resolve_idempotency` is refused
+again.
+
+### Keys, calls, and attempts
+
+A key belongs to the **logical call**, not to an attempt, so Milestone 4A's
+retries share one claim — three attempts of `call_123` are still one claim of
+`payment-456`, and the record reports `attempts=1`:
+
+```text
+ToolRequested  idempotency_key=payment-456
+ToolStarted      attempt=1 -> ToolFailed
+ToolRetryScheduled             attempt=2
+ToolStarted      attempt=2 -> ToolCompleted
+```
+
+### What the database guarantees, and what it cannot
+
+| | |
+| --- | --- |
+| uniqueness | `idempotency_key` is the PRIMARY KEY: two local executions cannot both hold a claim |
+| atomicity | claiming, resolving and consuming an authorization each happen in one `IMMEDIATE` transaction |
+| concurrency | two local writers serialize on SQLite's write lock; one wins, the other sees the claim |
+| *not* covered | anything about the external world — a `PENDING` key after a crash may or may not correspond to a request that succeeded |
+
+There is no distributed lock here, and no claim about two machines. The
+concurrency guarantee is exactly "one local writer per key".
+
+### Replay is read-only
+
+A replay answers a keyed call from the recorded history instead of the ledger:
+
+```text
+idempotency key -> the recorded ToolRequested -> the recorded result
+```
+
+`ReplayIdempotencyGuard` has no store behind it, so a replay cannot claim a
+key, insert a `PENDING` record, overwrite a result, or execute a tool — there is
+no code path from a replay to the database. `tests/test_idempotency_replay.py`
+compares every column of every row before and after.
+
+### CLI
+
+```bash
+agent-runtime idempotency list                      # the PENDING keys
+agent-runtime idempotency list --all --json         # every record
+agent-runtime idempotency show welcome-user-123
+agent-runtime idempotency resolve welcome-user-123 --action retry
+agent-runtime idempotency resolve welcome-user-123 --action mark_completed \
+    --result '{"message_id": "msg-1"}'
+```
+
+### API
+
+| | |
+| --- | --- |
+| `execution.call(..., idempotency_key=...)` | claim, execute, store the outcome |
+| `execution.idempotency_record(key)` | the stored claim, or `None` |
+| `execution.pending_idempotency` | every claim still in flight |
+| `execution.unresolved_idempotency` | the ones needing a decision |
+| `execution.needs_idempotency_resolution` | bool |
+| `execution.resolve_idempotency(key, action, ...)` | `retry` / `mark_completed` / `mark_failed` |
+| `runtime.idempotency` | the `IdempotencyStore` itself |
+| `runtime.idempotency_records(...)`, `runtime.pending_idempotency(...)` | queries |
+| `runtime.resolve_idempotency(key, action, ...)` | the operator's API, no execution handle needed |
+| `recovery_info.pending_idempotency` | what a crash left unresolved |
 
 ## Milestone 4A: retries and attempt semantics
 
@@ -419,6 +604,7 @@ python examples/basic_usage.py          # journal, tools, recovery
 python examples/checkpoint_recovery.py  # checkpoint, real crash, recovery, decision
 python examples/replay.py               # replay without re-running tools, and a mismatch
 python examples/retries.py              # attempts, backoff, classification, a crash mid-retry
+python examples/idempotency.py          # keys, a crash between claim and outcome, resolution
 ```
 
 ## Tests
@@ -446,6 +632,21 @@ committed, before the attempt it scheduled — and asserts the recovered
 execution still knows the retry was scheduled and still holds the attempt
 history. No test waits: they all inject a `RecordingSleeper`, so the whole suite
 runs in seconds.
+
+`tests/test_idempotency.py`, `tests/test_idempotency_crash.py`,
+`tests/test_idempotency_concurrency.py`, `tests/test_idempotency_replay.py` and
+`tests/test_idempotency_cli.py` are the Milestone 4B suite: the lifecycle of a
+key, duplicates that do not execute, failures that are not retried behind your
+back, pending records that make an execution `RECOVERY_REQUIRED`, the three
+explicit resolutions, checkpoint interaction, and the transaction boundaries
+between the claim and the outcome. Two of them are worth calling out:
+
+* the crash tests kill a child process with `os._exit` at two points — after the
+  side effect but before `ToolCompleted`, and after `ToolCompleted` but before
+  the outcome is stored — and assert that a second process refuses to send the
+  email again and reports the key as unresolved;
+* the replay tests compare every column of every row of `idempotency_records`
+  before and after a replay, so "read-only" is checked, not assumed.
 
 ## License
 

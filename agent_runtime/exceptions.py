@@ -37,6 +37,12 @@ __all__ = [
     "StateReconstructionError",
     "ReplayError",
     "ReplayMismatchError",
+    "IdempotencyError",
+    "IdempotencyKeyConflictError",
+    "IdempotencyRecoveryRequiredError",
+    "IdempotencyKeyFailedError",
+    "IdempotencyResolutionError",
+    "UnknownIdempotencyKeyError",
 ]
 
 
@@ -317,3 +323,131 @@ def _json(value: Any) -> str:
         return json.dumps(value, sort_keys=True)
     except (TypeError, ValueError):  # pragma: no cover - payloads are JSON-safe
         return repr(value)
+
+
+# ---------------------------------------------------------------------------
+# Idempotency (Milestone 4B)
+# ---------------------------------------------------------------------------
+
+
+class IdempotencyError(AgentRuntimeError):
+    """Base class for everything that stops a keyed side effect from running twice.
+
+    Each subclass says something different to the application, because the three
+    cases need three different decisions:
+
+    * :class:`IdempotencyKeyConflictError` -- the key is already claimed; the
+      call is deduplicated against the recorded outcome;
+    * :class:`IdempotencyRecoveryRequiredError` -- the key is ``PENDING`` and the
+      runtime does not know whether the external effect happened;
+    * :class:`IdempotencyKeyFailedError` -- the key is ``FAILED``; the recorded
+      failure stands until the application says otherwise.
+
+    None of them is "the database is unhappy". All of them are the runtime
+    refusing to guess, which is the entire point of the milestone.
+    """
+
+
+class IdempotencyKeyConflictError(IdempotencyError):
+    """A second claim of an idempotency key that already exists.
+
+    Raised by :meth:`~agent_runtime.idempotency.IdempotencyStore.claim` inside
+    its transaction, and by SQLite's ``PRIMARY KEY`` as the backstop. It carries
+    the existing :attr:`record` when the claim was refused because a row was
+    there to read.
+    """
+
+    def __init__(
+        self,
+        summary: str,
+        *,
+        idempotency_key: str,
+        record: Any | None = None,
+    ) -> None:
+        super().__init__(summary)
+        self.idempotency_key = idempotency_key
+        self.record = record
+
+
+class IdempotencyRecoveryRequiredError(IdempotencyError):
+    """A keyed call arrived while its key was still ``PENDING``.
+
+    The exact shape a crash leaves::
+
+        claim key
+            -> the external side effect happens
+            -> the process dies before the outcome is stored
+
+    On restart the runtime cannot know whether the effect happened -- SQLite
+    committed the claim, the world did the side effect, and nothing recorded the
+    answer. So it refuses to run the tool and hands the decision back through
+    :meth:`~agent_runtime.execution.Execution.resolve_idempotency`.
+
+    Attributes:
+        idempotency_key: The key that is unresolved.
+        record: The ``PENDING`` :class:`~agent_runtime.idempotency.IdempotencyRecord`.
+    """
+
+    def __init__(
+        self, summary: str, *, idempotency_key: str, record: Any | None = None
+    ) -> None:
+        super().__init__(summary)
+        self.idempotency_key = idempotency_key
+        self.record = record
+
+    def __str__(self) -> str:
+        return "\n".join(
+            [
+                "IdempotencyRecoveryRequiredError",
+                "",
+                f"Reason: {self.args[0]}",
+                f"Key: {self.idempotency_key}",
+                "",
+                "The runtime cannot tell whether the external side effect happened,",
+                "so it did not run the tool. Decide explicitly:",
+                "",
+                "    execution.resolve_idempotency(key, 'mark_completed', result=...)",
+                "    execution.resolve_idempotency(key, 'mark_failed', error=...)",
+                "    execution.resolve_idempotency(key, 'retry')",
+            ]
+        )
+
+
+class IdempotencyKeyFailedError(IdempotencyError):
+    """A keyed call arrived while its key was recorded as ``FAILED``.
+
+    The failure is known, but a failed attempt is not proof that the external
+    side effect did not partially happen, so the runtime still does not run the
+    tool again on its own.
+    """
+
+    def __init__(
+        self, summary: str, *, idempotency_key: str, record: Any | None = None
+    ) -> None:
+        super().__init__(summary)
+        self.idempotency_key = idempotency_key
+        self.record = record
+
+
+class IdempotencyResolutionError(IdempotencyError):
+    """An explicit idempotency resolution that the store refuses to apply.
+
+    For example resolving a key that is already ``COMPLETED``: a recorded
+    outcome stands, and overwriting it is exactly the kind of silent guess this
+    milestone avoids.
+    """
+
+    def __init__(
+        self,
+        summary: str,
+        *,
+        idempotency_key: str | None = None,
+        record: Any | None = None,
+    ) -> None:
+        super().__init__(summary)
+        self.idempotency_key = idempotency_key
+        self.record = record
+
+
+class UnknownIdempotencyKeyError(IdempotencyResolutionError):
+    """A resolution was asked for a key the idempotency store has never seen."""

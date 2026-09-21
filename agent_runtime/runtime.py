@@ -18,6 +18,14 @@ from .checkpoints import Checkpoint, CheckpointStore
 from .events import Event, EventType, new_id
 from .execution import Execution
 from .exceptions import ExecutionExistsError
+from .idempotency import (
+    IdempotencyAction,
+    IdempotencyRecord,
+    IdempotencyStatus,
+    IdempotencyStore,
+    StoreIdempotencyGuard,
+    unresolved_records,
+)
 from .journal import EventJournal
 from .replay import ReplayEngine, ReplayResult, ReplayStep
 from .recovery import RecoveryInfo, recover_execution
@@ -58,6 +66,12 @@ class Runtime:
         self.store = SQLiteStore(db_path)
         self.journal = EventJournal(self.store)
         self.checkpoints = CheckpointStore(self.store)
+        #: The durable claim ledger (Milestone 4B): one row per idempotency key,
+        #: in the same database as the events, so a claim and the history that
+        #: explains it survive a restart together.
+        self.idempotency = IdempotencyStore(self.store)
+        #: Shared by every execution this runtime hands out.
+        self._idempotency_guard = StoreIdempotencyGuard(self.idempotency)
         self.registry = ToolRegistry(tools, register_defaults=register_default_tools)
         self.auto_checkpoint = auto_checkpoint
         #: Shared by every execution this runtime hands out.
@@ -146,8 +160,18 @@ class Runtime:
         return self.recovery_info(execution_id).state
 
     def recovery_info(self, execution_id: str) -> RecoveryInfo:
-        """What recovery makes of an execution: its state, source and open calls."""
-        return recover_execution(self.journal, self.checkpoints, execution_id)
+        """What recovery makes of an execution: its state, source and open calls.
+
+        Includes the idempotency keys that execution still holds (Milestone 4B),
+        so an unresolved side effect is reported even when the journal itself
+        looks clean.
+        """
+        return recover_execution(
+            self.journal,
+            self.checkpoints,
+            execution_id,
+            idempotency=self._idempotency_guard,
+        )
 
     def get_checkpoints(self, execution_id: str) -> list[Checkpoint]:
         """Every stored checkpoint of an execution, oldest first."""
@@ -160,6 +184,62 @@ class Runtime:
     def list_executions(self) -> list[str]:
         """Every execution id present in the journal."""
         return self.journal.list_execution_ids()
+
+    # -- idempotency ---------------------------------------------------------
+
+    def idempotency_record(self, key: str) -> IdempotencyRecord | None:
+        """The stored claim for ``key``, or ``None`` when nothing claimed it.
+
+        This is the read-only view an operator has after a crash: it says what
+        the runtime *committed to* doing, never what the outside world did.
+        """
+        return self.idempotency.get(key)
+
+    def idempotency_records(
+        self,
+        *,
+        execution_id: str | None = None,
+        status: IdempotencyStatus | None = None,
+    ) -> tuple[IdempotencyRecord, ...]:
+        """Every stored claim matching the filters, oldest first."""
+        return self.idempotency.list_for(execution_id=execution_id, status=status)
+
+    def pending_idempotency(
+        self, execution_id: str | None = None
+    ) -> tuple[IdempotencyRecord, ...]:
+        """Claims with no recorded outcome -- the ones recovery must not retry."""
+        return self.idempotency.pending_for(execution_id)
+
+    def unresolved_idempotency(
+        self, execution_id: str | None = None
+    ) -> tuple[IdempotencyRecord, ...]:
+        """The pending claims that need an explicit decision right now."""
+        return unresolved_records(self.pending_idempotency(execution_id))
+
+    def resolve_idempotency(
+        self,
+        key: str,
+        action: IdempotencyAction,
+        *,
+        result: Any = None,
+        error: Any = None,
+        note: str | None = None,
+    ) -> IdempotencyRecord:
+        """Settle a key without going through an :class:`Execution`.
+
+        The same three actions as
+        :meth:`Execution.resolve_idempotency`, and the same refusals. The
+        difference is the one an operator needs: this does not require the
+        execution that holds the claim to be resumed, which is what makes it
+        usable from a CLI in a different process. It is still an explicit
+        decision -- the runtime never makes one on its own.
+
+        Returns:
+            The updated :class:`~agent_runtime.idempotency.IdempotencyRecord`.
+        """
+        return self._idempotency_guard.resolve(
+            key, action, result=result, error=error, note=note
+        )
 
     # -- replay --------------------------------------------------------------
 
@@ -241,6 +321,7 @@ class Runtime:
             recovered_state=recovered_state,
             auto_checkpoint=self.auto_checkpoint,
             sleeper=self.sleeper,
+            idempotency=self._idempotency_guard,
         )
 
     # -- lifecycle -----------------------------------------------------------

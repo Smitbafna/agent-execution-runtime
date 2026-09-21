@@ -58,6 +58,46 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_checkpoints_execution
         ON checkpoints (execution_id, sequence DESC)
     """,
+    # The idempotency ledger (Milestone 4B): one row per idempotency key.
+    #
+    #   * PRIMARY KEY is the whole guarantee of uniqueness: two local executions
+    #     racing for one key cannot both insert, so one of them sees the other's
+    #     claim instead (see IdempotencyStore.claim);
+    #   * the row is *updated* in place -- unlike events, which are append-only --
+    #     because a record has a lifecycle: PENDING -> COMPLETED / FAILED. It is a
+    #     claim ledger, not a history;
+    #   * retry_authorized is how an explicit "run it again" survives without
+    #     pretending an outcome is known: the record stays PENDING, and exactly
+    #     one further claim is allowed to consume the authorization.
+    """
+    CREATE TABLE IF NOT EXISTS idempotency_records (
+        idempotency_key  TEXT    NOT NULL PRIMARY KEY,
+        execution_id     TEXT    NOT NULL,
+        call_id          TEXT    NOT NULL,
+        tool_name        TEXT    NOT NULL,
+        arguments        TEXT    NOT NULL,
+        status           TEXT    NOT NULL,
+        result           TEXT,
+        error            TEXT,
+        created_at       TEXT    NOT NULL,
+        updated_at       TEXT    NOT NULL,
+        attempts         INTEGER NOT NULL DEFAULT 1,
+        retry_authorized INTEGER NOT NULL DEFAULT 0,
+        resolution       TEXT,
+        resolution_note  TEXT,
+        resolved_at      TEXT
+    )
+    """,
+    # Recovery asks "which keys does this execution still have in flight?" on
+    # every resume, and the CLI asks for every unresolved key in the database.
+    """
+    CREATE INDEX IF NOT EXISTS idx_idempotency_execution
+        ON idempotency_records (execution_id, status)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_idempotency_status
+        ON idempotency_records (status)
+    """,
 )
 
 
@@ -85,6 +125,12 @@ class SQLiteStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # Two local writers -- two processes, or two Runtime objects over one file
+        # -- serialize on SQLite's write lock. Without a busy timeout the loser
+        # would get "database is locked" instead of waiting its turn, which is how
+        # a second claim of an idempotency key would surface as a storage error
+        # rather than as "this key is already claimed".
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._closed = False
         self.create_schema()
 

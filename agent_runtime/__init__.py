@@ -1,37 +1,55 @@
-"""Agent Execution Runtime -- Milestone 4A: retries and attempt semantics.
+"""Agent Execution Runtime -- Milestone 4B: idempotency, crash-safe side effects.
 
 The invariant this milestone adds:
+
+    A side-effecting tool never runs twice for one idempotency key unless the
+    application explicitly asks for it, and every key whose outcome the runtime
+    does not know is reported rather than guessed at.
+
+Quick start::
+
+    from agent_runtime import Runtime
+
+    with Runtime("agent.db") as runtime:
+        execution = runtime.start(goal="Welcome the new user")
+        execution.call(
+            "send_email",
+            to="user@example.com",
+            body="welcome!",
+            idempotency_key="welcome-user-123",   # <-- the guard
+        )
+
+If that process dies between the claim and the outcome, the key survives as
+``PENDING`` and the next process refuses to send the email again::
+
+    execution = runtime.resume(execution_id)
+    print(execution.status)                 # RECOVERY_REQUIRED
+    print(execution.unresolved_idempotency) # the keys it cannot answer for
+
+    execution.resolve_idempotency("welcome-user-123", action="mark_completed",
+                                  result={"message_id": "abc"})  # I checked: it sent
+    execution.resolve_idempotency("welcome-user-123", action="retry")          # or run once more
+
+Milestone 4A's invariant still holds, and is what makes retries of a keyed call
+safe::
 
     A logical tool call keeps one stable call_id while it may make several
     numbered attempts; every attempt is journalled, and the state reports the
     final one.
 
-Quick start::
-
-    from agent_runtime import PermanentToolError, RetryPolicy, RetryableToolError, Runtime
-
-    @runtime.tool(retry_policy=RetryPolicy(max_attempts=3))
-    def fetch_data(url: str) -> str:
-        if not reachable(url):
-            raise RetryableToolError("upstream is down")   # eligible for retry
-        if bad_request(url):
-            raise PermanentToolError("400 from upstream")  # never retried
-        return download(url)
-
-    execution = runtime.start(goal="Fetch the data")
-    execution.call("fetch_data", url="https://example.com/data")
-
-Milestone 2's invariant still holds, and is what makes the above recoverable:
+Milestone 2's invariant still holds too, and is what makes all of this
+recoverable:
 
     A recovered execution represents a valid state derived from a consistent
     checkpoint plus the events that were durably persisted after it.
 
-So after a crash::
+And the limit is stated plainly, because no amount of bookkeeping removes it:
 
-    with Runtime("agent.db") as runtime:
-        execution = runtime.resume(execution_id)       # checkpoint + events after it
-        print(execution.pending_retries)              # a retry was scheduled, not run
-        print(execution.recovery_info())              # and what, if anything, is unresolved
+    This runtime does not provide exactly-once execution of external side
+    effects. SQLite cannot commit atomically with an HTTP request, so a key left
+    PENDING after a crash may correspond to a request that did happen. That is
+    why the answer to a PENDING key is an explicit decision -- retry,
+    mark_completed or mark_failed -- and never an assumption.
 """
 
 from __future__ import annotations
@@ -65,6 +83,11 @@ from .exceptions import (
     ExecutionError,
     ExecutionExistsError,
     ExecutionNotFoundError,
+    IdempotencyError,
+    IdempotencyKeyConflictError,
+    IdempotencyKeyFailedError,
+    IdempotencyRecoveryRequiredError,
+    IdempotencyResolutionError,
     InconsistentCheckpointError,
     InvalidRecoveryActionError,
     InvalidStateTransitionError,
@@ -83,9 +106,21 @@ from .exceptions import (
     ToolError,
     ToolInvocationError,
     ToolNotFoundError,
+    UnknownIdempotencyKeyError,
     UnknownToolCallError,
 )
 from .checkpoints import Checkpoint, CheckpointStore
+from .idempotency import (
+    IdempotencyAction,
+    IdempotencyDecision,
+    IdempotencyGuard,
+    IdempotencyRecord,
+    IdempotencyStatus,
+    IdempotencyStore,
+    ReplayIdempotencyGuard,
+    StoreIdempotencyGuard,
+    unresolved_records,
+)
 from .recovery import RecoveryInfo, recover_execution
 from .replay import (
     RecordedAttempt,
@@ -129,7 +164,7 @@ from .state import (
 from .storage import SQLiteStore
 from .tools import Tool, ToolRegistry, tool
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "__version__",
@@ -168,6 +203,16 @@ __all__ = [
     "Sleeper",
     "RealSleeper",
     "RecordingSleeper",
+    # idempotency
+    "IdempotencyStore",
+    "IdempotencyRecord",
+    "IdempotencyStatus",
+    "IdempotencyAction",
+    "IdempotencyDecision",
+    "IdempotencyGuard",
+    "StoreIdempotencyGuard",
+    "ReplayIdempotencyGuard",
+    "unresolved_records",
     # state
     "ExecutionState",
     "ExecutionStatus",
@@ -203,6 +248,12 @@ __all__ = [
     "InvalidStateTransitionError",
     "InvalidRecoveryActionError",
     "UnknownToolCallError",
+    "IdempotencyError",
+    "IdempotencyKeyConflictError",
+    "IdempotencyRecoveryRequiredError",
+    "IdempotencyKeyFailedError",
+    "IdempotencyResolutionError",
+    "UnknownIdempotencyKeyError",
     "ToolError",
     "ReplayError",
     "ReplayMismatchError",

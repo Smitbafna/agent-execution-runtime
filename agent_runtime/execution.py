@@ -21,6 +21,19 @@ The decision to make another attempt is journalled before the wait and before
 the attempt, so a process that dies during the backoff leaves the scheduled
 retry in the journal rather than only in the memory of a process that was about
 to sleep.
+
+Milestone 4B adds the idempotency key to that story, because the attempt loop
+alone cannot survive the window between the side effect and its record::
+
+    claim key -> run tool -> [process dies] -> recovery
+
+:meth:`Execution.call` takes an ``idempotency_key``, claims it before the tool
+runs, and stores the outcome afterwards. A duplicate of a ``COMPLETED`` key is
+answered from the stored result without running anything; a key left ``PENDING``
+by a crash is *not* answered at all -- it raises
+:class:`~agent_runtime.exceptions.IdempotencyRecoveryRequiredError`, because the
+runtime cannot know whether the external effect happened and will not guess.
+:meth:`Execution.resolve_idempotency` is the explicit way out.
 """
 
 from __future__ import annotations
@@ -30,9 +43,20 @@ from typing import Any, Literal
 from .checkpoints import Checkpoint, CheckpointStore
 from .events import Event, EventType, describe_error, new_id
 from .exceptions import (
+    IdempotencyResolutionError,
     InvalidRecoveryActionError,
     InvalidStateTransitionError,
+    UnknownIdempotencyKeyError,
     UnknownToolCallError,
+)
+from .idempotency import (
+    IdempotencyAction,
+    IdempotencyGuard,
+    IdempotencyRecord,
+    IdempotencyStore,
+    ReplayIdempotencyGuard,
+    StoreIdempotencyGuard,
+    unresolved_records,
 )
 from .journal import EventJournal
 from .recovery import RecoveryInfo, recover_execution
@@ -74,6 +98,20 @@ _ACTION_RESULTS: dict[str, Any] = {
 }
 
 
+def _default_guard(journal: EventJournal) -> IdempotencyGuard:
+    """The guard an execution gets when the caller does not supply one.
+
+    A journalled run keeps its claims in the same SQLite file as its events, so
+    the default is a guard over that database. A journal with no store behind it
+    -- the in-memory one a replay builds -- gets the store-less replay guard
+    instead, because a replay must not write to a real database.
+    """
+    store = getattr(journal, "store", None)
+    if store is None:
+        return ReplayIdempotencyGuard()
+    return StoreIdempotencyGuard(IdempotencyStore(store))
+
+
 class Execution:
     """A single execution, backed by its immutable event history."""
 
@@ -88,6 +126,7 @@ class Execution:
         auto_checkpoint: bool = False,
         runner: ToolRunner | None = None,
         sleeper: Sleeper | None = None,
+        idempotency: IdempotencyGuard | None = None,
     ) -> None:
         self._journal = journal
         self._registry = registry
@@ -98,6 +137,12 @@ class Execution:
         #: Carries out each ``call``. Defaults to the NORMAL runner; replay
         #: passes a REPLAY runner that serves recorded results instead.
         self._runner = runner if runner is not None else ToolRunner(registry)
+        #: Decides whether a keyed ``call`` may run its tool (Milestone 4B).
+        #: Defaults to a guard over the journal's own SQLite store; a replay --
+        #: whose journal is in memory -- substitutes the store-less
+        #: :class:`~agent_runtime.idempotency.ReplayIdempotencyGuard`, so it can
+        #: never claim, insert or overwrite anything.
+        self._idempotency = idempotency if idempotency is not None else _default_guard(journal)
         #: How retry backoff waits. Injectable so a test can assert the
         #: schedule without spending it -- nothing here patches ``time.sleep``.
         self._sleeper = sleeper if sleeper is not None else RealSleeper()
@@ -141,7 +186,23 @@ class Execution:
 
     @property
     def status(self) -> ExecutionStatus:
-        return self.state.status
+        """The execution's status, including anything still unresolved about a key.
+
+        ``RECOVERY_REQUIRED`` is reported for either kind of ambiguity
+        (Milestone 2's open tool call, Milestone 4B's ``PENDING`` key), because
+        both mean the same thing to a caller: the runtime cannot tell you what
+        happened, and will not run the side effect again on its own.
+
+        The stored :class:`~agent_runtime.state.ExecutionState` is untouched --
+        a checkpoint still holds the journal-derived status, so recovery re-derives
+        this the same way instead of trusting two sources for one field.
+        """
+        state = self.state
+        if state.status is not ExecutionStatus.RUNNING:
+            return state.status
+        if self.needs_idempotency_resolution:
+            return ExecutionStatus.RECOVERY_REQUIRED
+        return state.status
 
     @property
     def goal(self) -> str | None:
@@ -164,6 +225,109 @@ class Execution:
     @property
     def needs_recovery(self) -> bool:
         return self.status is ExecutionStatus.RECOVERY_REQUIRED
+
+    # -- idempotency (Milestone 4B) --------------------------------------------
+
+    @property
+    def idempotency(self) -> IdempotencyGuard:
+        """The guard deciding whether a keyed call may run its tool."""
+        return self._idempotency
+
+    @property
+    def pending_idempotency(self) -> tuple[IdempotencyRecord, ...]:
+        """Every key this execution still holds a claim on.
+
+        A claim with no recorded outcome. Each one is an external side effect
+        whose result this database does not hold -- either still running, or
+        interrupted by a crash.
+        """
+        return self._idempotency.pending_records(self._id)
+
+    @property
+    def unresolved_idempotency(self) -> tuple[IdempotencyRecord, ...]:
+        """The pending keys that need an explicit decision.
+
+        The subset of :attr:`pending_idempotency` with no authorized retry
+        outstanding: for those, :meth:`call` raises
+        :class:`~agent_runtime.exceptions.IdempotencyRecoveryRequiredError`
+        rather than executing, and :attr:`status` reports ``RECOVERY_REQUIRED``.
+        """
+        return unresolved_records(self.pending_idempotency)
+
+    @property
+    def needs_idempotency_resolution(self) -> bool:
+        """True when at least one key of this execution is unresolved."""
+        return bool(self.unresolved_idempotency)
+
+    def idempotency_record(self, key: str) -> IdempotencyRecord | None:
+        """The store's record for ``key``, or ``None`` if nothing claimed it."""
+        return self._idempotency.get(key)
+
+    def resolve_idempotency(
+        self,
+        key: str,
+        action: IdempotencyAction,
+        *,
+        result: Any = None,
+        error: Any = None,
+        note: str | None = None,
+    ) -> IdempotencyRecord:
+        """Settle one key explicitly, and store that decision durably.
+
+        This is the *only* way out of a ``PENDING`` or ``FAILED`` key, and it is
+        deliberately not something the runtime does by itself::
+
+            execution.resolve_idempotency("email-123", action="retry")
+            execution.resolve_idempotency("email-123", action="mark_completed", result=known)
+            execution.resolve_idempotency("email-123", action="mark_failed", error="declined")
+
+        ``retry``
+            authorizes exactly one more execution of the key. The record stays
+            ``PENDING`` -- nobody has said whether the effect happened -- and the
+            authorization is consumed by the next :meth:`call` that uses the key.
+        ``mark_completed``
+            records an externally known successful result. Every later duplicate
+            call is answered with it, without running the tool.
+        ``mark_failed``
+            records a known failure. The key is resolved in the sense that its
+            outcome is known, but it still will not run again without an explicit
+            ``retry``.
+
+        Args:
+            key: The idempotency key to settle.
+            action: ``retry``, ``mark_completed`` or ``mark_failed``.
+            result: The known result, for ``mark_completed``. Take it from the
+                journal when the journal has it -- ``execution.tool_calls``
+                already holds what the crashed attempt recorded.
+            error: The known failure, for ``mark_failed``.
+            note: An optional free-text note recorded with the decision.
+
+        Returns:
+            The updated :class:`~agent_runtime.idempotency.IdempotencyRecord`.
+
+        Raises:
+            UnknownIdempotencyKeyError: no such key was ever claimed.
+            IdempotencyResolutionError: the action is unknown, the key is already
+                ``COMPLETED``, or the key belongs to a different execution.
+        """
+        record = self._idempotency.get(key)
+        if record is None:
+            raise UnknownIdempotencyKeyError(
+                f"Execution {self._id!r} has no idempotency record for key {key!r}",
+                idempotency_key=str(key),
+            )
+        if record.execution_id != self._id:
+            raise IdempotencyResolutionError(
+                f"Idempotency key {key!r} is held by execution "
+                f"{record.execution_id!r}, not {self._id!r}; resolve it there",
+                idempotency_key=str(key),
+                record=record,
+            )
+        settled = self._idempotency.resolve(
+            key, action, result=result, error=error, note=note
+        )
+        self._maybe_auto_checkpoint()
+        return settled
 
     @property
     def pending_retries(self) -> tuple[PendingRetry, ...]:
@@ -203,6 +367,7 @@ class Execution:
                     "error": call.error,
                     "attempt": call.attempt,
                     "attempts": [item.to_dict() for item in call.attempts],
+                    "idempotency_key": call.idempotency_key,
                     "pending_retry": (
                         None if call.pending_retry is None else call.pending_retry.to_dict()
                     ),
@@ -211,6 +376,7 @@ class Execution:
             ],
             "incomplete_tools": [item.to_dict() for item in state.incomplete_tools],
             "pending_retries": [item.to_dict() for item in detect_pending_retries(state)],
+            "pending_idempotency": [record.to_dict() for record in self.pending_idempotency],
         }
 
     # -- lifecycle -----------------------------------------------------------
@@ -220,6 +386,7 @@ class Execution:
         name: str,
         *args: Any,
         retry_policy: RetryPolicy | None = None,
+        idempotency_key: str | None = None,
         **kwargs: Any,
     ) -> Any:
         """Run a registered tool as one logical call, journalling every attempt.
@@ -249,6 +416,38 @@ class Execution:
         the function; replay supplies a ``REPLAY`` runner over a recorded
         history instead (see :mod:`agent_runtime.replay`), so both paths journal
         the same way and neither can diverge from the other.
+
+        Idempotency (Milestone 4B)
+        --------------------------
+
+        ``idempotency_key`` names the side effect this call is allowed to
+        perform, and is what stops a recovery from performing it twice::
+
+            execution.call("send_email", to=..., idempotency_key="welcome-123")
+
+        The key is claimed *before* the tool runs and its outcome stored *after*,
+        and the key belongs to the **logical call**, not to an attempt: all three
+        attempts above share one claim, because they are one intended side
+        effect.
+
+        What the runtime will and will not do with a key it finds:
+
+        * no record       -> claim it (``PENDING``), run the tool, store the outcome;
+        * ``COMPLETED``   -> return the stored result and **do not run the tool**;
+        * ``PENDING``     -> raise :class:`IdempotencyRecoveryRequiredError`;
+        * ``FAILED``      -> raise :class:`IdempotencyKeyFailedError`;
+        * retry authorized -> consume the authorization and run the tool.
+
+        A duplicate is still journalled, flagged ``deduplicated``: it is a real
+        outcome of *this* execution and replaying the history has to reproduce
+        it. See :meth:`resolve_idempotency` for the only way out of the two
+        refusals.
+
+        Raises:
+            IdempotencyRecoveryRequiredError: the key is ``PENDING`` from a
+                previous, unresolved attempt. The tool did not run.
+            IdempotencyKeyFailedError: the key is recorded as ``FAILED``.
+            ToolInvocationError: the tool itself failed for good.
         """
         self._require_running("call a tool")
 
@@ -256,22 +455,102 @@ class Execution:
         # argument list is a programming error, and nothing was attempted.
         request = self._prepare_request(name, args, kwargs)
         policy = self._resolve_retry_policy(name, retry_policy)
-
         call_id = self._new_call_id()
         self._runner.begin_call(call_id, request)
+
+        if idempotency_key is None:
+            self._emit_requested(request, call_id, policy)
+            return self._attempt_until_settled(request, call_id, policy, attempt=1)
+
+        # The claim is committed before the tool runs, and deliberately outside
+        # any transaction that could cover it: the external call is not
+        # undoable, so the intent has to be durable first. A crash after this
+        # point leaves PENDING -- the honest answer, and the one recovery
+        # refuses to guess about.
+        decision = self._idempotency.begin_call(
+            idempotency_key,
+            execution_id=self._id,
+            call_id=call_id,
+            tool=request.tool,
+            arguments=request.arguments,
+        )
+        if decision.deduplicated:
+            return self._record_deduplicated(
+                request, call_id, policy, idempotency_key, decision.result
+            )
+
+        self._emit_requested(request, call_id, policy, idempotency_key=idempotency_key)
+        try:
+            result = self._attempt_until_settled(request, call_id, policy, attempt=1)
+        except Exception as exc:
+            # A recorded failure is a known outcome, so the key can be settled as
+            # FAILED. Only Exception, never BaseException: a KeyboardInterrupt or a
+            # SIGKILL means "unknown", and unknown has to stay PENDING.
+            self._idempotency.record_outcome(idempotency_key, error=describe_error(exc))
+            raise
+        self._idempotency.record_outcome(idempotency_key, result=result)
+        return result
+
+    def _emit_requested(
+        self,
+        request: ToolRequest,
+        call_id: str,
+        policy: RetryPolicy,
+        *,
+        idempotency_key: str | None = None,
+        deduplicated: bool = False,
+    ) -> None:
+        """Journal ``ToolRequested``: one logical call, and its fixed identity.
+
+        The idempotency key goes in here and nowhere else, so the whole attempt
+        history -- and every replay of it -- hangs off one key.
+        """
+        payload: dict[str, Any] = {
+            "call_id": call_id,
+            "tool": request.tool,
+            "arguments": dict(request.arguments),
+            # Recorded so that the policy a call ran under -- and the
+            # backoff schedule derived from it -- can be read back long
+            # after the process that used it is gone.
+            "retry_policy": policy.to_dict(),
+        }
+        if idempotency_key is not None:
+            payload["idempotency_key"] = idempotency_key
+        if deduplicated:
+            payload["deduplicated"] = True
+        self._append(EventType.TOOL_REQUESTED, payload)
+
+    def _record_deduplicated(
+        self,
+        request: ToolRequest,
+        call_id: str,
+        policy: RetryPolicy,
+        idempotency_key: str,
+        result: Any,
+    ) -> Any:
+        """Journal a call the idempotency store answered instead of running.
+
+        No ``ToolStarted`` is written, because nothing started: the tool was not
+        invoked, and saying otherwise would put a side effect in the journal that
+        never happened. The call is settled with the result the first claim
+        recorded, so the history of *this* execution stays complete -- and
+        replayable.
+        """
+        self._emit_requested(
+            request, call_id, policy, idempotency_key=idempotency_key, deduplicated=True
+        )
         self._append(
-            EventType.TOOL_REQUESTED,
+            EventType.TOOL_COMPLETED,
             {
                 "call_id": call_id,
                 "tool": request.tool,
-                "arguments": request.arguments,
-                # Recorded so that the policy a call ran under -- and the
-                # backoff schedule derived from it -- can be read back long
-                # after the process that used it is gone.
-                "retry_policy": policy.to_dict(),
+                "attempt": 1,
+                "result": result,
+                "idempotency_key": idempotency_key,
+                "deduplicated": True,
             },
         )
-        return self._attempt_until_settled(request, call_id, policy, attempt=1)
+        return result
 
     def continue_pending_retry(self, call_id: str) -> Any:
         """Carry on the attempt that a crash interrupted.
@@ -434,8 +713,22 @@ class Execution:
         self._sleeper.sleep(decision.delay)
 
     def complete(self, result: Any = None) -> None:
-        """Mark the execution COMPLETED and journal ``ExecutionCompleted``."""
+        """Mark the execution COMPLETED and journal ``ExecutionCompleted``.
+
+        Refused while an idempotency key is unresolved (Milestone 4B): a side
+        effect of unknown outcome is not something to close out quietly. Settle
+        the keys with :meth:`resolve_idempotency` -- or give up on the execution
+        with :meth:`fail` / :meth:`mark_cancelled`, which are allowed precisely
+        because they are decisions.
+        """
         self._require_running("complete")
+        unresolved = self.unresolved_idempotency
+        if unresolved:
+            keys = ", ".join(record.idempotency_key for record in unresolved)
+            raise InvalidStateTransitionError(
+                f"Cannot complete: execution {self._id!r} has unresolved idempotency "
+                f"key(s) {keys}; settle them with resolve_idempotency(...) first"
+            )
         self._append(EventType.EXECUTION_COMPLETED, {"result": make_jsonable(result)})
         self._maybe_auto_checkpoint()
 
@@ -502,9 +795,12 @@ class Execution:
             print(execution.recovery_info())
 
         The state it reports is the one :attr:`state` holds: the latest
-        checkpoint plus the events durably persisted after it.
+        checkpoint plus the events durably persisted after it, plus the
+        idempotency claims still in flight (Milestone 4B).
         """
-        return recover_execution(self._journal, self.checkpoints, self._id)
+        return recover_execution(
+            self._journal, self.checkpoints, self._id, idempotency=self._idempotency
+        )
 
     def resolve_recovery(
         self,
@@ -628,21 +924,39 @@ class Execution:
         return self.checkpoint()
 
     def _require_running(self, action: str) -> None:
-        self._require_status(action, ExecutionStatus.RUNNING)
+        """The *journal's* verdict on whether this execution may do new work.
+
+        Deliberately :attr:`state`-derived rather than :attr:`status`-derived. An
+        unresolved idempotency key must not stop an application from asking for
+        that key again -- asking is how the runtime gets to answer with
+        :class:`~agent_runtime.exceptions.IdempotencyRecoveryRequiredError` and
+        its instructions, instead of a bare "this execution is
+        ``RECOVERY_REQUIRED``". An open tool call still blocks new work, exactly
+        as in Milestone 2.
+        """
+        self._require_status(
+            action, ExecutionStatus.RUNNING, status=self.state.status
+        )
 
     def _require_active(self, action: str) -> None:
         """Allow anything that is not already finished, including recovery."""
         self._require_status(action, None)
 
-    def _require_status(self, action: str, required: ExecutionStatus | None) -> None:
-        status = self.status
-        if required is not None and status is not required:
+    def _require_status(
+        self,
+        action: str,
+        required: ExecutionStatus | None,
+        *,
+        status: ExecutionStatus | None = None,
+    ) -> None:
+        current = self.status if status is None else status
+        if required is not None and current is not required:
             raise InvalidStateTransitionError(
-                f"Cannot {action}: execution {self._id!r} is {status}"
+                f"Cannot {action}: execution {self._id!r} is {current}"
             )
-        if required is None and status.is_terminal:
+        if required is None and current.is_terminal:
             raise InvalidStateTransitionError(
-                f"Cannot {action}: execution {self._id!r} already finished as {status}"
+                f"Cannot {action}: execution {self._id!r} already finished as {current}"
             )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
@@ -655,4 +969,7 @@ class Execution:
             lines.append(f"  ! {item} [{item.status}] stuck at sequence {item.sequence}")
         for retry in self.pending_retries:
             lines.append(f"  ~ {retry} (recorded at sequence {retry.sequence})")
+        for record in self.pending_idempotency:
+            note = "retry authorized" if record.retry_authorized else "UNRESOLVED"
+            lines.append(f"  * key {record.idempotency_key} [{note}] {record}")
         return "\n".join(lines)
