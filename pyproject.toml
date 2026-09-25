@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-execution-runtime"
 version = "0.5.0"
-description = "A durable, event-sourced execution runtime for AI agents (Milestone 4B: idempotency and crash-safe side effects)"
+description = "A durable, event-sourced execution runtime for AI agents (Milestone 4C: timeouts, cancellation, reliability)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 keywords = [
     "event-sourcing", "journal", "checkpoints", "recovery", "retries",
-    "backoff", "idempotency", "agents", "runtime", "durability",
+    "backoff", "idempotency", "timeouts", "cancellation", "agents",
+    "runtime", "durability",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

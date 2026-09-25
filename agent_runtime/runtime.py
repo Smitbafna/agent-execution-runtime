@@ -91,6 +91,7 @@ class Runtime:
         *,
         name: str | None = None,
         retry_policy: RetryPolicy | None = None,
+        timeout: float | None = None,
     ) -> Any:
         """Decorator form of :meth:`register_tool`::
 
@@ -102,15 +103,24 @@ class Runtime:
 
             @runtime.tool(retry_policy=RetryPolicy(max_attempts=3))
             def greet(name: str): ...
+
+            @runtime.tool(timeout=5.0)            # Milestone 4C
+            async def slow_tool(): ...
+
+        ``timeout`` is the tool's *default* deadline; a call-level
+        ``execution.call("slow_tool", timeout=1.0)`` overrides it. An invalid
+        value is reported here, where it was written.
         """
         if func is None:
             def decorator(target: Callable[..., Any]) -> Tool:
                 return self.registry.register(
-                    tool(target, name=name, retry_policy=retry_policy)
+                    tool(target, name=name, retry_policy=retry_policy, timeout=timeout)
                 )
 
             return decorator
-        return self.registry.register(tool(func, name=name, retry_policy=retry_policy))
+        return self.registry.register(
+            tool(func, name=name, retry_policy=retry_policy, timeout=timeout)
+        )
 
     # -- executions ----------------------------------------------------------
 
@@ -164,7 +174,9 @@ class Runtime:
 
         Includes the idempotency keys that execution still holds (Milestone 4B),
         so an unresolved side effect is reported even when the journal itself
-        looks clean.
+        looks clean, and :attr:`~agent_runtime.recovery.RecoveryInfo.recovery_state`
+        is the one-line answer to "what should a restart do about this?"
+        (Milestone 4C).
         """
         return recover_execution(
             self.journal,
@@ -172,6 +184,28 @@ class Runtime:
             execution_id,
             idempotency=self._idempotency_guard,
         )
+
+    def cancel(self, execution_id: str, reason: Any = None) -> Execution:
+        """Cancel a running execution from outside it, and journal that fact.
+
+        Milestone 4C's operator entry point -- the same durable decision
+        :meth:`Execution.cancel` makes, reachable from a CLI in a different
+        process::
+
+            runtime.cancel("exec_123", reason="operator stopped the queue")
+
+        It resumes the execution (so the journal, not this method, decides what
+        is cancellable), calls :meth:`Execution.cancel`, and hands the execution
+        back so the caller can inspect what it settled.
+
+        A cancelled execution is ``CANCELLED`` afterwards, in this process and
+        in every later one. Nothing retries it: a cancellation is a decision,
+        and re-deciding it on restart would be the runtime second-guessing the
+        application.
+        """
+        execution = self.resume(execution_id)
+        execution.cancel(reason)
+        return execution
 
     def get_checkpoints(self, execution_id: str) -> list[Checkpoint]:
         """Every stored checkpoint of an execution, oldest first."""

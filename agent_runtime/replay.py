@@ -47,6 +47,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
 
 from .checkpoints import CheckpointStore
+from .cancellation import CancellationToken
 from .events import Event, EventType, new_id
 from .exceptions import (
     ExecutionNotFoundError,
@@ -71,6 +72,7 @@ from .state import (
     initial_state,
     reconstruct_state,
 )
+from .timeout import ResolvedTimeout
 from .tools import make_jsonable
 
 __all__ = [
@@ -88,6 +90,33 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # The recorded history, distilled to the tool calls a replay must reproduce
 # ---------------------------------------------------------------------------
+
+
+def _as_float(value: Any) -> float | None:
+    """A journalled deadline back as a float, or ``None`` when there was none.
+
+    A journal written before Milestone 4C carries no ``timeout`` key at all,
+    which means "no deadline" -- so an old history replays exactly as it did.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):  # pragma: no cover - payloads are numeric
+        return None
+
+
+def _recorded_deadline(entry: Mapping[str, Any] | None) -> dict[str, Any]:
+    """One call's recorded deadline fields, ready for ``dataclasses.replace``.
+
+    Takes the whole per-call entry rather than a field name so a missing key
+    cannot be confused with a field called ``"timeout"`` inside it.
+    """
+    entry = entry or {}
+    return {
+        "timeout": _as_float(entry.get("timeout")),
+        "timeout_mode": entry.get("timeout_mode"),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +205,12 @@ class RecordedToolCall:
     #: straight out of the recorded ``ToolRequested`` payload, the same way the
     #: retry policy is.
     deduplicated: bool = False
+    #: The deadline the original call was journalled with, and the mode that
+    #: enforced it (Milestone 4C). Carried like :attr:`retry_policy` so a replay
+    #: re-emits the same ``ToolRequested`` -- and, more importantly, so it never
+    #: tries to *enforce* a deadline of its own.
+    timeout: float | None = None
+    timeout_mode: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -218,6 +253,8 @@ class RecordedToolCall:
             "retry_policy": None if self.retry_policy is None else self.retry_policy.to_dict(),
             "idempotency_key": self.idempotency_key,
             "deduplicated": self.deduplicated,
+            "timeout": self.timeout,
+            "timeout_mode": self.timeout_mode,
         }
 
     @classmethod
@@ -255,6 +292,7 @@ class RecordedToolCall:
         since: int = 0,
         policies: Mapping[str, Any] | None = None,
         deduplicated: Mapping[str, bool] | None = None,
+        timeouts: Mapping[str, Any] | None = None,
     ) -> tuple["RecordedToolCall", ...]:
         """Every tool call at or after ``since``, which a replay must reproduce.
 
@@ -262,8 +300,10 @@ class RecordedToolCall:
         (keyed by ``call_id``), so a replay re-emits ``ToolRequested`` with the
         policy the original ran under instead of the one it happens to have in
         this process. ``deduplicated`` says, the same way, which recorded calls
-        were answered from the idempotency store instead of being run (Milestone
-        4B) -- so the replay reproduces *those* as settled-without-running too.
+        were answered from the idempotency store instead of being run
+        (Milestone 4B) -- so the replay reproduces *those* as
+        settled-without-running too. ``timeouts`` (Milestone 4C) carries each
+        call's journalled deadline, for the same reason.
         """
         calls = tuple(
             cls.from_tool_call(call, index)
@@ -274,6 +314,11 @@ class RecordedToolCall:
         if policies:
             calls = tuple(
                 replace(call, retry_policy=RetryPolicy.from_dict(policies.get(call.call_id)))
+                for call in calls
+            )
+        if timeouts:
+            calls = tuple(
+                replace(call, **_recorded_deadline(timeouts.get(call.call_id)))
                 for call in calls
             )
         if deduplicated:
@@ -413,8 +458,22 @@ class ReplayToolRunner(ToolRunner):
             error=dict(scheduled.error or {}),
         )
 
-    def run(self, request: ToolRequest) -> ToolOutcome:
-        """Return the recorded outcome of the next recorded attempt. No tool runs."""
+    def run(
+        self,
+        request: ToolRequest,
+        *,
+        timeout: ResolvedTimeout | None = None,
+        token: CancellationToken | None = None,
+    ) -> ToolOutcome:
+        """Return the recorded outcome of the next recorded attempt. No tool runs.
+
+        Milestone 4C's most important non-implementation. The NORMAL runner
+        enforces a deadline by stopping a tool; this one has no tool, so the
+        ``timeout`` and ``token`` it is handed are read and discarded. A
+        recorded five-second timeout costs the replay no time at all, and a
+        recorded cancellation never cancels anything, because there is nothing
+        here that could be harmed by pretending otherwise.
+        """
         if self._active is None:
             # Driven without ``begin_call``: bind the next recorded call first.
             self.begin_call(self._match(request).call_id, request)
@@ -435,7 +494,15 @@ class ReplayToolRunner(ToolRunner):
         self._attempt_cursor += 1
         if recorded.succeeded:
             return ToolOutcome.completed(recorded.result)
-        return ToolOutcome(status=recorded.status, error=recorded.error)
+        return ToolOutcome(
+            status=recorded.status,
+            error=recorded.error,
+            # Carried through so a replayed ``ToolTimedOut`` carries the same
+            # deadline and the same ``enforced`` flag the original recorded.
+            timeout=call.timeout,
+            timeout_mode=call.timeout_mode,
+            timeout_enforced=bool((recorded.error or {}).get("enforced", True)),
+        )
 
     def check(self, request: ToolRequest) -> RecordedToolCall:
         """Validate a request against the recorded history without consuming it.
@@ -785,9 +852,15 @@ class ReplayExecution(Execution):
         """
         idempotency_key = kwargs.pop("idempotency_key", None)
         kwargs.pop("retry_policy", None)
+        # A replayed call is re-issued under the *recorded* deadline, never one
+        # this process happened to ask for, so ``timeout`` is consumed the same
+        # way ``retry_policy`` is.
+        timeout = kwargs.pop("timeout", None)
         self._check_recorded_key(idempotency_key)
         self._replay_runner.check(self._prepare_request(name, args, kwargs))
-        return super().call(name, *args, idempotency_key=idempotency_key, **kwargs)
+        return super().call(
+            name, *args, idempotency_key=idempotency_key, timeout=timeout, **kwargs
+        )
 
     def _check_recorded_key(self, idempotency_key: str | None) -> None:
         """Reject a replay whose key is not the one the journal recorded."""
@@ -937,6 +1010,9 @@ class ReplayExecution(Execution):
         }
         if recorded.idempotency_key is not None:
             payload["idempotency_key"] = recorded.idempotency_key
+        if recorded.timeout is not None:
+            payload["timeout"] = recorded.timeout
+            payload["timeout_mode"] = recorded.timeout_mode
         self._append(EventType.TOOL_REQUESTED, payload)
         for attempt in recorded.attempts:
             self._append(
@@ -968,6 +1044,21 @@ class ReplayExecution(Execution):
             self._append(EventType.TOOL_COMPLETED, {**payload, "result": attempt.result})
         elif attempt.status is ToolCallStatus.CANCELLED:
             self._append(EventType.TOOL_CANCELLED, {**payload, "error": dict(attempt.error or {})})
+        elif attempt.status is ToolCallStatus.TIMED_OUT:
+            # Milestone 4C: a replayed timeout is re-emitted as a timeout, with
+            # the deadline and the ``enforced`` flag the original recorded --
+            # never as a failure, and never by waiting for anything.
+            error = dict(attempt.error or {})
+            self._append(
+                EventType.TOOL_TIMED_OUT,
+                {
+                    **payload,
+                    "error": error,
+                    "timeout": error.get("timeout", recorded.timeout),
+                    "timeout_mode": error.get("timeout_mode", recorded.timeout_mode),
+                    "enforced": bool(error.get("enforced", True)),
+                },
+            )
         else:
             self._append(EventType.TOOL_FAILED, {**payload, "error": dict(attempt.error or {})})
 
@@ -1005,6 +1096,29 @@ class ReplayExecution(Execution):
         if self._cursor < len(self._recorded):
             return self._recorded[self._cursor].retry_policy or NO_RETRY
         return NO_RETRY
+
+    def _resolve_timeout(
+        self, name: str, call_timeout: float | None
+    ) -> ResolvedTimeout:
+        """The deadline the *recorded* call was journalled with.
+
+        Milestone 4C, and the same argument as :meth:`_resolve_retry_policy`: a
+        replay has no tool to stop, so it has nothing to enforce. The recorded
+        ``ToolRequested`` is the answer, and the replayed request carries the
+        same deadline the original ran under -- which is what keeps the two
+        histories identical, and what makes a replayed five-second timeout cost
+        no time at all.
+        """
+        if call_timeout is not None:
+            return ResolvedTimeout.from_dict(
+                {"timeout": call_timeout, "timeout_mode": None}
+            )
+        if self._cursor < len(self._recorded):
+            recorded = self._recorded[self._cursor]
+            return ResolvedTimeout.from_dict(
+                {"timeout": recorded.timeout, "timeout_mode": recorded.timeout_mode}
+            )
+        return ResolvedTimeout()
 
     def _append(self, event_type: EventType | str, payload: Mapping[str, Any]) -> Event:
         """Journal one replayed event, counting the retries it reproduced."""
@@ -1209,6 +1323,7 @@ _CALL_PHASE_EVENTS: frozenset[EventType] = frozenset(
         EventType.TOOL_COMPLETED,
         EventType.TOOL_FAILED,
         EventType.TOOL_CANCELLED,
+        EventType.TOOL_TIMED_OUT,
     }
 )
 
@@ -1273,6 +1388,7 @@ class ReplayEngine:
             since=self.from_sequence,
             policies=self._recorded_policies(),
             deduplicated=self._recorded_deduplicated(),
+            timeouts=self._recorded_timeouts(),
         )
         mirror = self.journal.get_events_from(self.execution_id, self.from_sequence)
 
@@ -1412,6 +1528,40 @@ class ReplayEngine:
             call_id: bool(payload)
             for call_id, payload in self._recorded_request_field("deduplicated").items()
         }
+
+    def _recorded_timeouts(self) -> dict[str, dict[str, Any]]:
+        """Each recorded call's deadline and mode, keyed by ``call_id``.
+
+        Milestone 4C, read out of the recorded ``ToolRequested`` exactly as the
+        retry policy is. The replay re-emits the deadline so its journal matches
+        the original's -- and, because
+        :meth:`~agent_runtime.replay.ReplayToolRunner.run` enforces nothing, it
+        costs the replay nothing.
+        """
+        return {
+            call_id: {
+                "timeout": payload.get("timeout"),
+                "timeout_mode": payload.get("timeout_mode"),
+            }
+            for call_id, payload in self._recorded_request_fields(
+                ("timeout", "timeout_mode")
+            ).items()
+        }
+
+    def _recorded_request_fields(
+        self, fields: tuple[str, ...]
+    ) -> dict[str, dict[str, Any]]:
+        """Several fields of every recorded ``ToolRequested``, keyed by ``call_id``."""
+        recorded: dict[str, dict[str, Any]] = {}
+        for event in self.journal.get_events(self.execution_id):
+            if (
+                event.event_type is EventType.TOOL_REQUESTED
+                and event.sequence > self.from_sequence
+            ):
+                recorded[str(event.payload.get("call_id"))] = {
+                    field: event.payload.get(field) for field in fields
+                }
+        return recorded
 
     def _recorded_request_field(self, field: str) -> dict[str, Any]:
         """One field of every recorded ``ToolRequested`` payload, keyed by ``call_id``."""

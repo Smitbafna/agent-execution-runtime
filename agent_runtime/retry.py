@@ -30,13 +30,18 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
 from .exceptions import (
     PermanentToolError,
     RetryConfigurationError,
     RetryableToolError,
+    ToolCancelledError,
+    ToolTimedOutError,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from .cancellation import CancellationToken
 
 __all__ = [
     "ErrorKind",
@@ -46,6 +51,7 @@ __all__ = [
     "RealSleeper",
     "RecordingSleeper",
     "classify_error",
+    "wait_interrupted",
     "NO_RETRY",
 ]
 
@@ -59,17 +65,28 @@ class ErrorKind(StrEnum):
     PERMANENT = "PERMANENT"
     #: Anything else. Retried only when a policy explicitly opts in.
     UNEXPECTED = "UNEXPECTED"
+    #: The attempt ran out of time (Milestone 4C). Retried only when the policy
+    #: sets ``retry_on_timeout`` -- a deadline is a *statement about time*, and
+    #: whether a second attempt would have more of it is the application's call.
+    TIMEOUT = "TIMEOUT"
+    #: The attempt was cancelled (Milestone 4C). Never retried: cancellation is
+    #: a decision, not a fault, and repeating it would repeat the decision.
+    CANCELLED = "CANCELLED"
 
 
 def classify_error(error: BaseException | str | None) -> ErrorKind:
     """Classify a failure for the purpose of retrying it.
 
-    Deliberately narrow: only the two error types a tool can raise are
-    classified. Everything else -- a bug in the tool, a ``TypeError`` -- is
+    Deliberately narrow: only the error types a tool can raise are classified.
+    Everything else -- a bug in the tool, a ``TypeError`` -- is
     :attr:`ErrorKind.UNEXPECTED`, which :meth:`RetryPolicy.should_retry` refuses
     by default. Guessing that an unknown exception "looks transient" is exactly
     the sort of inference this milestone is not making.
     """
+    if isinstance(error, ToolCancelledError):
+        return ErrorKind.CANCELLED
+    if isinstance(error, ToolTimedOutError):
+        return ErrorKind.TIMEOUT
     if isinstance(error, RetryableToolError):
         return ErrorKind.RETRYABLE
     if isinstance(error, PermanentToolError):
@@ -130,6 +147,11 @@ class RetryPolicy:
             :class:`~agent_runtime.exceptions.PermanentToolError` may be retried.
             ``False`` by default: an unexpected exception is a bug until proven
             otherwise, and retrying it only hides the bug.
+        retry_on_timeout: Whether an attempt that ran out of time may be retried
+            (Milestone 4C). ``False`` by default, and deliberately: a deadline is
+            a statement about time, and whether another attempt would get more of
+            it is the application's judgement, not the runtime's. A cancellation
+            is never retried whatever this says.
     """
 
     max_attempts: int = 1
@@ -137,6 +159,7 @@ class RetryPolicy:
     multiplier: float = 2.0
     max_delay: float = 10.0
     retry_on_unknown: bool = False
+    retry_on_timeout: bool = False
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
@@ -173,11 +196,17 @@ class RetryPolicy:
             "multiplier": self.multiplier,
             "max_delay": self.max_delay,
             "retry_on_unknown": self.retry_on_unknown,
+            "retry_on_timeout": self.retry_on_timeout,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | "RetryPolicy" | None) -> "RetryPolicy":
-        """Rebuild a policy from :meth:`to_dict` output; ``None`` means no retry."""
+        """Rebuild a policy from :meth:`to_dict` output; ``None`` means no retry.
+
+        ``retry_on_timeout`` defaults to ``False`` for a journal written before
+        Milestone 4C, which is the same answer the default gives -- so an old
+        ``ToolRequested`` reads back as exactly the policy it described.
+        """
         if data is None:
             return NO_RETRY
         if isinstance(data, RetryPolicy):
@@ -189,6 +218,7 @@ class RetryPolicy:
                 multiplier=float(data["multiplier"]),
                 max_delay=float(data["max_delay"]),
                 retry_on_unknown=bool(data.get("retry_on_unknown", False)),
+                retry_on_timeout=bool(data.get("retry_on_timeout", False)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RetryConfigurationError(
@@ -218,6 +248,15 @@ class RetryPolicy:
         kind = self.classify(error)
         if kind is ErrorKind.PERMANENT:
             return False
+        if kind is ErrorKind.CANCELLED:
+            # Milestone 4C: a cancellation is a decision, not a fault. Retrying
+            # it would re-issue the decision nobody asked for a second time.
+            return False
+        if kind is ErrorKind.TIMEOUT:
+            # Milestone 4C: opt-in, because "it ran out of time" does not imply
+            # "it would have finished given more time" -- that is a judgement
+            # about the tool, and it belongs to whoever configured the policy.
+            return self.retry_on_timeout
         if kind is ErrorKind.RETRYABLE:
             return True
         return self.retry_on_unknown
@@ -251,12 +290,13 @@ class RetryPolicy:
             )
 
     def __str__(self) -> str:
-        if self.max_attempts == 1 and not self.retry_on_unknown:
+        if self.max_attempts == 1 and not self.retry_on_unknown and not self.retry_on_timeout:
             return "no retries"
         return (
             f"max_attempts={self.max_attempts}, initial_delay={self.initial_delay}, "
             f"multiplier={self.multiplier}, max_delay={self.max_delay}"
             + (", retry_on_unknown" if self.retry_on_unknown else "")
+            + (", retry_on_timeout" if self.retry_on_timeout else "")
         )
 
 
@@ -282,15 +322,54 @@ class Sleeper(Protocol):
         """Wait for ``delay`` seconds."""
         ...
 
+    def interruptible_sleep(
+        self, delay: float, token: "CancellationToken | None" = None
+    ) -> bool:  # pragma: no cover - protocol
+        """Wait for ``delay`` seconds, returning ``True`` if cancelled first.
+
+        Milestone 4C. Optional: :func:`wait_interrupted` falls back to
+        :meth:`sleep` for a sleeper that does not implement it, so a 4A-era
+        sleeper keeps working.
+        """
+        self.sleep(delay)
+        return bool(token is not None and token.is_cancelled())
+
 
 class RealSleeper:
-    """Production sleeper: actually waits, unless there is nothing to wait for."""
+    """Production sleeper: actually waits, unless there is nothing to wait for.
+
+    :meth:`interruptible_sleep` is the Milestone 4C addition. A backoff that
+    cannot be interrupted is a backoff that keeps a cancelled execution alive
+    for the rest of its delay, so the wait is made on the cancellation token's
+    :class:`threading.Event` -- which returns the instant another thread calls
+    ``cancel()`` -- rather than inside ``time.sleep``.
+    """
 
     __slots__ = ()
 
     def sleep(self, delay: float) -> None:
         if delay > 0:
             time.sleep(delay)
+
+    def interruptible_sleep(
+        self, delay: float, token: "CancellationToken | None" = None
+    ) -> bool:
+        """Wait ``delay`` seconds, or until ``token`` is cancelled.
+
+        Returns:
+            ``True`` if the wait was cut short by cancellation, ``False`` if it
+            ran to completion.
+
+        Without a token this is exactly :meth:`sleep`, and it calls it -- so a
+        sleeper written for Milestone 4A, or a subclass that overrides ``sleep``
+        to inspect the call, still sees every wait go through it.
+        """
+        if delay <= 0:
+            return bool(token is not None and token.is_cancelled())
+        if token is None:
+            self.sleep(delay)
+            return False
+        return token.wait(delay)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return "RealSleeper()"
@@ -329,8 +408,45 @@ class RecordingSleeper:
     def __len__(self) -> int:
         return len(self._delays)
 
+    def interruptible_sleep(
+        self, delay: float, token: "CancellationToken | None" = None
+    ) -> bool:
+        """Record the delay and return immediately; report any cancellation.
+
+        A test never spends a backoff, so the "interruption" here is simply
+        whether the token was *already* cancelled when the wait was requested --
+        which is exactly the state a test that cancels mid-retry wants to
+        exercise, without a thread having to race a clock.
+
+        It goes through :meth:`sleep` so a subclass that overrides ``sleep`` to
+        inspect a wait (as several of this repo's tests do) still sees it.
+        """
+        self.sleep(delay)
+        return bool(token is not None and token.is_cancelled())
+
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"RecordingSleeper(delays={self.delays!r})"
+
+
+def wait_interrupted(
+    sleeper: Sleeper, delay: float, token: "CancellationToken | None" = None
+) -> bool:
+    """Wait ``delay`` through ``sleeper``, cut short by ``token``.
+
+    Milestone 4C: the retry backoff goes through here, so a cancellation during
+    a ten-second wait returns immediately instead of sleeping it out.
+
+    A sleeper that predates :meth:`Sleeper.interruptible_sleep` still works --
+    the wait is then made with :meth:`Sleeper.sleep` and only checked
+    afterwards -- so third-party sleepers written for Milestone 4A keep working
+    unchanged, at the cost of not being interrupted mid-wait.
+    """
+    interruptible = getattr(sleeper, "interruptible_sleep", None)
+    if interruptible is not None:
+        return bool(interruptible(delay, token))
+    if delay > 0:
+        sleeper.sleep(delay)
+    return bool(token is not None and token.is_cancelled())
 
     error: Mapping[str, Any] | None = None
 

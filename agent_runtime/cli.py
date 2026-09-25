@@ -2,6 +2,7 @@
 
     agent-runtime replay <execution-id>
     agent-runtime list
+    agent-runtime cancel <execution-id> [--reason TEXT]
     agent-runtime idempotency list
     agent-runtime idempotency show <key>
     agent-runtime idempotency resolve <key> --action retry
@@ -10,6 +11,10 @@
 prints what the replay served, one line per recorded tool call. Nothing is
 executed -- every result comes from the journal -- and the original history is
 not modified.
+
+``cancel`` is Milestone 4C's operator window. It journals a cancellation for a
+running execution from another process, which is durable: the execution stays
+``CANCELLED`` afterwards and nothing retries it.
 
 ``idempotency`` is the operator's window onto Milestone 4B. After a crash it
 shows which keys the runtime committed to and never learned the outcome of, and
@@ -145,6 +150,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--note", metavar="TEXT", help="A note recorded with the decision."
     )
     key_resolve.set_defaults(handler=_cmd_idempotency_resolve)
+
+    cancel = subcommands.add_parser(
+        "cancel",
+        help="Cancel a running execution (Milestone 4C).",
+        description=(
+            "Request cancellation of a running execution and journal it. The "
+            "decision is durable: a cancelled execution stays CANCELLED after a "
+            "restart, and nothing retries it."
+        ),
+    )
+    cancel.add_argument("execution_id", help="Execution id to cancel (exec_...).")
+    cancel.add_argument(
+        "--reason", metavar="TEXT", help="Why. Recorded with the cancellation."
+    )
+    cancel.set_defaults(handler=_cmd_cancel)
 
     return parser
 
@@ -317,6 +337,25 @@ def _record_line(record: IdempotencyRecord) -> str:
         f"attempts={record.attempts}  {record.tool_name}({record.call_id})"
         + (f"  retry authorized x{record.retry_authorized}" if record.retry_authorized else "")
     )
+
+
+def _cmd_cancel(runtime: Runtime, args: argparse.Namespace, out: TextIO) -> int:
+    """Cancel an execution, and report what recovery now makes of it."""
+    runtime.cancel(args.execution_id, reason=args.reason)
+    info = runtime.recovery_info(args.execution_id)
+
+    print(f"Cancelled {args.execution_id}", file=out)
+    if args.reason:
+        print(f"  reason     : {args.reason}", file=out)
+    print(f"  status     : {info.status}", file=out)
+    print(f"  classified : {info.recovery_state}", file=out)
+    for call in info.cancelled_calls:
+        print(f"  {call}", file=out)
+    print(
+        "\nA cancelled execution is not resumed, and nothing retries its calls.",
+        file=out,
+    )
+    return 0
 
 
 def _parse_json_option(raw: str, flag: str) -> Any:

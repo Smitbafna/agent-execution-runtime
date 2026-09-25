@@ -13,7 +13,7 @@ It also supports deterministic replay, retries, idempotency, and eventually time
 * [x] Checkpoints and state reconstruction
 * [x] Tool retries with exponential backoff
 * [x] Idempotent tool execution
-* [ ] Tool timeouts and cancellation
+* [x] Tool timeouts and cancellation
 * [ ] Execution inspection and debugging
 * [ ] Time-travel debugging
 * [ ] Execution branching
@@ -46,6 +46,203 @@ pip install -e .
 agent-runtime --help
 ```
 
+## Milestone 4C: timeouts, cancellation and reliability
+
+The invariant this milestone is built around:
+
+> A timeout stops the tool or the runtime says it could not; a cancellation is a
+> decision, never a retry; and an ambiguous side effect is reported, never
+> resolved by a guess.
+
+```text
+Tool Call
+   |
+   +-- attempt
+   |     +-- success      -> ToolCompleted
+   |     +-- failure      -> ToolFailed      -> retry, per the policy
+   |     +-- timeout      -> ToolTimedOut    -> retry only if retry_on_timeout,
+   |     |                                           and never for a keyed call
+   |     |                                           whose stop was unenforceable
+   |     +-- cancellation -> ToolCancelled   -> never retried
+   |
+   +-- idempotency
+          +-- COMPLETED -> reuse the stored result, run nothing
+          +-- PENDING   -> RECOVERY_REQUIRED, an explicit decision
+```
+
+### Timeouts
+
+```python
+execution.call("slow_tool", timeout=5.0)          # per call
+```
+
+```python
+@tool(timeout=5.0)                                # the tool's default
+async def slow_tool(): ...
+```
+
+A call-level `timeout` always wins over the tool's default. The deadline and the
+mechanism that will enforce it are journalled on `ToolRequested`, so a resumed
+retry reuses the same rule rather than re-deriving one from a tool that may have
+changed.
+
+**A timeout is enforced by actually stopping the tool.** That is only possible
+for some kinds of tool, and the runtime is explicit about which:
+
+| Tool | Mechanism | Real stop? |
+| --- | --- | --- |
+| `async def` tool | `asyncio.wait_for` cancels the coroutine | yes -- `CancelledError` is delivered at its `await` |
+| `def` tool declaring `cancel_token` | the token is flipped at the deadline, then the tool is *waited for* | yes if it stops; `enforced=False` if it does not |
+| `def` tool with no token | **refused** with `UnsupportedTimeoutError` | it cannot be stopped at all |
+
+The third row is the point. Python has no safe way to terminate a running
+thread, so a wrapper that timed the call and then reported a timeout would be
+claiming a stop that never happened. The runtime refuses instead:
+
+```text
+Cannot enforce a 1.0s timeout on tool 'unstoppable': it is a synchronous
+function with no cancellation token, and Python cannot terminate a running
+thread. Write it as 'async def' so a deadline can cancel it, or declare a
+'cancel_token' parameter so the runtime can ask it to stop.
+```
+
+The refusal happens *before* `ToolRequested`, so an unenforceable deadline never
+gets a call id, never claims an idempotency key, and never leaves a claim behind.
+
+### The `enforced` flag
+
+`ToolTimedOut` carries `timeout`, `timeout_mode` and `enforced`, and `enforced`
+is the honest report of what the runtime could prove:
+
+* `enforced=True` -- the tool was really stopped. The external effect did not
+  complete, so a keyed call is settled `FAILED` and the failure is known.
+* `enforced=False` -- the runtime asked a thread to stop and it did not. The
+  side effect may still have happened, so a keyed call is left `PENDING` and the
+  execution reports `RECOVERY_REQUIRED`.
+
+That distinction is the whole of the timeout/idempotency interaction, and it is
+why the flag exists rather than a plain "did it time out".
+
+### Cancellation
+
+```python
+execution.cancel("user pressed stop")
+```
+
+`ToolStarted -> ToolCancelled -> ExecutionCancelled`, all durable, and safe to
+call from another thread -- which is the usual case, since the thread being
+cancelled is the one inside the tool. Also available as an operator command:
+
+```bash
+agent-runtime --db agent.db cancel exec_123 --reason "queue drained"
+```
+
+### Cooperative cancellation
+
+A tool opts in by *declaring* a `cancel_token` parameter. Tools that do not
+declare one are called exactly as before, with no extra argument and no change
+to their recorded arguments.
+
+```python
+@tool
+def sync_records(cancel_token: CancellationToken, limit: int) -> dict:
+    for row in stream(limit):
+        if cancel_token.is_cancelled():
+            return {"stopped_early": True}
+        handle(row)
+    return {"stopped_early": False}
+```
+
+`token.is_cancelled()` reads a flag, so it is cheap enough for a tight loop;
+`token.raise_if_cancelled()` is the raising form, and `token.wait(timeout)` is
+the interrupting one.
+
+### Retry, timeout and cancellation
+
+One policy answers for all three, and keeps them apart:
+
+```python
+RetryPolicy(max_attempts=3, retry_on_timeout=True)
+```
+
+* a **failure** is retried when the tool said `RetryableToolError`;
+* a **timeout** is retried only with `retry_on_timeout=True`. The default is
+  `False`: "it ran out of time" does not imply "it would have finished given
+  more", and that is a judgement about the tool, not the runtime's to make;
+* a **cancellation** is never retried, whatever the policy says. Cancelling is
+  a decision, and a policy that retried it would re-issue a decision nobody
+  asked to repeat.
+
+### Cancellation during a retry backoff
+
+A cancellation interrupts the wait rather than being noticed after it:
+
+```text
+attempt fails
+    -> retry scheduled in 10 seconds
+    -> execution.cancel()
+    -> the wait ends immediately, the call settles CANCELLED
+```
+
+The sleeper gained an `interruptible_sleep(delay, token)` seam for this;
+`RealSleeper` waits on the token's `threading.Event`, which returns the instant
+another thread calls `cancel()`. A sleeper written for Milestone 4A still works --
+`wait_interrupted` falls back to `sleep` -- it just is not interrupted mid-wait,
+and its `sleep` override is still what gets called.
+
+The scheduled retry is already durable at that point, so the history records
+both facts, and the reducer reads the cancellation as the final word. The call
+ends `CANCELLED` with its pending retry cleared, so nothing can resume it.
+
+### What recovery does with each state
+
+`RecoveryInfo.recovery_state` is the one-line answer to "what should a restart do
+about this?":
+
+| `RecoveryState` | When | What happens |
+| --- | --- | --- |
+| `COMPLETED` / `FAILED` / `CANCELLED` | the journal recorded a decision | returned as it stands; a cancelled execution is not resumed |
+| `RECOVERY_REQUIRED` | an open tool call, or a key whose effect may have happened | an explicit decision; nothing is re-run |
+| `RETRYABLE` | a retry was scheduled and has not started | carry it on with `continue_pending_retry` |
+| `RUNNING` | ordinary in-flight work | carry on |
+
+Ambiguity outranks a pending retry, and a recorded terminal decision outranks
+both: overriding a deliberate cancellation would itself be a guess.
+
+```python
+info = runtime.recovery_info(execution_id)
+info.recovery_state        # RecoveryState.RECOVERY_REQUIRED
+info.timed_out_calls       # calls that ran out of time
+info.unenforced_timeouts   # the ones the runtime could not prove stopped
+info.cancelled_calls       # calls stopped on purpose
+```
+
+### Replay
+
+Replay reproduces every reliability event without running anything, and without
+waiting:
+
+* a recorded timeout is served from the journal, so a replayed five-second
+  timeout costs no time at all;
+* a recorded cancellation is a fact to reproduce, not an instruction to carry
+  out -- there is no live tool to cancel, and the replay never tries;
+* a recorded retry, including the backoff it waited, is reproduced from the
+  journal rather than re-decided.
+
+`ReplayToolRunner.run` accepts the deadline and the token and discards both: it
+has no function to call, so it has nothing to stop.
+
+### The limits, stated plainly
+
+* A timeout cannot stop a plain synchronous tool. That is refused, not faked.
+* A cooperative tool that ignores its token is reported as `enforced=False`; the
+  runtime does not claim a stop it cannot prove.
+* An unenforceable timeout on a keyed call leaves the key `PENDING`. The side
+  effect may have happened, so the answer is `RECOVERY_REQUIRED` and an explicit
+  `resolve_idempotency` -- never a retry and never a guess.
+* This runtime still does not provide exactly-once execution of external side
+  effects. SQLite cannot commit atomically with an HTTP request, so a key left
+  `PENDING` after a crash may correspond to a request that did happen.
 ## Milestone 4B: idempotency & crash-safe side effects
 
 The invariant this milestone is built around:
@@ -605,6 +802,7 @@ python examples/checkpoint_recovery.py  # checkpoint, real crash, recovery, deci
 python examples/replay.py               # replay without re-running tools, and a mismatch
 python examples/retries.py              # attempts, backoff, classification, a crash mid-retry
 python examples/idempotency.py          # keys, a crash between claim and outcome, resolution
+python examples/reliability.py          # the whole 4C story, in nine scenes
 ```
 
 ## Tests
@@ -647,6 +845,32 @@ between the claim and the outcome. Two of them are worth calling out:
   email again and reports the key as unresolved;
 * the replay tests compare every column of every row of `idempotency_records`
   before and after a replay, so "read-only" is checked, not assumed.
+
+`tests/test_timeouts.py`, `tests/test_cancellation.py`,
+`tests/test_reliability_integration.py` and `tests/test_reliability_crash.py`
+are the Milestone 4C suite, and `tests/failure_tools.py` holds the
+deterministic failure-injection tools the milestone asks for -- a tool that
+always fails, one that fails once, one that sleeps forever, one that
+cooperatively cancels, and one that performs a side effect and then refuses to
+stop. They live in `tests/` and nothing in the package imports them, because a
+runtime that ships a tool whose job is to hang forever is shipping a hazard.
+
+Two of them are worth singling out:
+
+* the timeout tests use a **real clock**. `test_an_async_tool_is_really_cancelled_at_its_deadline`
+  asserts on elapsed time and on the coroutine's own cleanup running, which is
+  the only way to check that a deadline *stopped* something rather than merely
+  measuring it. `test_a_plain_sync_tool_is_refused_a_deadline_rather_than_faked`
+  is the counterpart: it asserts that the runtime *refuses* rather than
+  pretending;
+* `test_the_journal_survives_two_threads_writing_at_once` and
+  `test_a_transaction_nested_inside_another_joins_it` cover the storage change
+  that cross-thread cancellation required. `execution.cancel()` is documented as
+  callable from another thread while a tool runs, which means two threads
+  reaching the journal through one SQLite connection -- and without
+  serialization the second `BEGIN` fails outright, so the caller would see a
+  storage error instead of a cancelled execution. That was a real failure
+  before the test existed.
 
 ## License
 

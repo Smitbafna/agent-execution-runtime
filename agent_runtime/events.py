@@ -47,6 +47,14 @@ class EventType(StrEnum):
     #: only in the memory of the process that was about to sleep.
     TOOL_RETRY_SCHEDULED = "ToolRetryScheduled"
     TOOL_CANCELLED = "ToolCancelled"
+    #: The attempt's deadline expired (Milestone 4C). Durable and explicit,
+    #: rather than hidden inside a generic failure: a timeout is *not* a
+    #: failure, it says the call ran out of time, and an application -- or a
+    #: recovery -- has to be able to tell the two apart. The payload carries
+    #: ``timeout``, ``mode`` and ``enforced``, so a reader can tell a coroutine
+    #: that was genuinely cancelled from a thread that was asked to stop and
+    #: did not.
+    TOOL_TIMED_OUT = "ToolTimedOut"
 
 
 EVENT_TYPES: frozenset[EventType] = frozenset(EventType)
@@ -63,6 +71,7 @@ TERMINAL_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.TOOL_COMPLETED,
         EventType.TOOL_FAILED,
         EventType.TOOL_CANCELLED,
+        EventType.TOOL_TIMED_OUT,
         EventType.EXECUTION_COMPLETED,
         EventType.EXECUTION_FAILED,
         EventType.EXECUTION_CANCELLED,
@@ -207,5 +216,6 @@ _TOOL_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.TOOL_FAILED,
         EventType.TOOL_RETRY_SCHEDULED,
         EventType.TOOL_CANCELLED,
+        EventType.TOOL_TIMED_OUT,
     }
 )

@@ -34,18 +34,43 @@ by a crash is *not* answered at all -- it raises
 :class:`~agent_runtime.exceptions.IdempotencyRecoveryRequiredError`, because the
 runtime cannot know whether the external effect happened and will not guess.
 :meth:`Execution.resolve_idempotency` is the explicit way out.
+
+Milestone 4C adds the two stops a call can end on that are not failures, and
+keeps them apart from failures at every layer -- event, status, exception, retry
+decision::
+
+    ToolStarted
+        ↓
+    deadline reached / execution.cancel()
+        ↓
+    ToolTimedOut  |  ToolCancelled
+        ↓
+    the same retry policy answers, differently
+
+A timeout is enforced by actually stopping the tool -- an ``asyncio`` deadline
+for a coroutine, a cancellation token for a ``def`` tool that declared one --
+and is *refused* for a ``def`` tool that did not, because Python cannot
+terminate a thread and a wrapper that only measured elapsed time would be
+reporting a stop that never happened. A cancellation is never retried, because
+cancelling is a decision rather than a fault. Neither collapses into
+``ToolFailed``, because an application reading a recovered journal has to be
+able to tell them apart without parsing a message.
 """
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
+from .cancellation import CancellationToken
 from .checkpoints import Checkpoint, CheckpointStore
 from .events import Event, EventType, describe_error, new_id
 from .exceptions import (
+    AgentRuntimeError,
     IdempotencyResolutionError,
     InvalidRecoveryActionError,
     InvalidStateTransitionError,
+    ToolCancelledError,
+    ToolTimedOutError,
     UnknownIdempotencyKeyError,
     UnknownToolCallError,
 )
@@ -66,6 +91,7 @@ from .retry import (
     RetryDecision,
     RetryPolicy,
     Sleeper,
+    wait_interrupted,
 )
 from .runner import ToolRequest, ToolRunner
 from .state import (
@@ -74,9 +100,11 @@ from .state import (
     IncompleteTool,
     PendingRetry,
     ToolCall,
+    ToolCallStatus,
     detect_pending_retries,
     reconstruct_state,
 )
+from .timeout import ResolvedTimeout, TimeoutMode, check_timeout, resolve_timeout
 from .tools import ToolRegistry, check_retry_policy, make_jsonable
 
 __all__ = ["Execution", "RecoveryAction"]
@@ -96,6 +124,46 @@ _ACTION_RESULTS: dict[str, Any] = {
     "mark_failed": {"message": "marked failed during recovery"},
     "cancel": {"message": "cancelled during recovery"},
 }
+
+
+class AmbiguousTimeoutError(AgentRuntimeError):
+    """A keyed call timed out and the runtime cannot prove its tool stopped.
+
+    The combination Milestone 4C exists to refuse: a side effect that may have
+    happened, wrapped in a deadline that expired. Retrying it could perform the
+    effect twice, and settling it would be a guess, so the runtime does neither
+    -- it raises this, leaves the key ``PENDING``, and lets the application
+    check the outside world and decide with
+    :meth:`~agent_runtime.execution.Execution.resolve_idempotency`.
+
+    Attributes:
+        idempotency_key: The key whose effect is now unknown.
+        tool_name: The tool that outlived its deadline.
+    """
+
+    def __init__(
+        self, summary: str, *, idempotency_key: str, tool_name: str | None = None
+    ) -> None:
+        super().__init__(summary)
+        self.idempotency_key = idempotency_key
+        self.tool_name = tool_name
+
+    def __str__(self) -> str:
+        return "\n".join(
+            [
+                "AmbiguousTimeoutError",
+                "",
+                f"Reason: {self.args[0]}",
+                f"Key: {self.idempotency_key}",
+                "",
+                "The runtime cannot tell whether the external side effect happened,",
+                "so it did not retry the call. Decide explicitly:",
+                "",
+                "    execution.resolve_idempotency(key, 'mark_completed', result=...)",
+                "    execution.resolve_idempotency(key, 'mark_failed', error=...)",
+                "    execution.resolve_idempotency(key, 'retry')",
+            ]
+        )
 
 
 def _default_guard(journal: EventJournal) -> IdempotencyGuard:
@@ -146,6 +214,26 @@ class Execution:
         #: How retry backoff waits. Injectable so a test can assert the
         #: schedule without spending it -- nothing here patches ``time.sleep``.
         self._sleeper = sleeper if sleeper is not None else RealSleeper()
+        #: Milestone 4C: the cooperative stop signal for this execution's tools.
+        #: One per execution, shared by every call it makes, because
+        #: ``cancel()`` cancels the *execution*: a tool that is mid-flight
+        #: cannot be told to stop while its siblings carry on.
+        self._cancel_token = CancellationToken()
+
+    @property
+    def cancel_token(self) -> CancellationToken:
+        """The token handed to tools of this execution that declared one.
+
+        Read-only on purpose. Cancelling is :meth:`cancel`'s job, because
+        ``cancel()`` is what makes the decision *durable* -- flipping the flag
+        alone would stop a tool without leaving a record that it was stopped.
+        """
+        return self._cancel_token
+
+    @property
+    def is_cancel_requested(self) -> bool:
+        """Whether this execution's cancellation has been requested."""
+        return self._cancel_token.is_cancelled()
 
     # -- identity / derived state --------------------------------------------
 
@@ -368,6 +456,8 @@ class Execution:
                     "attempt": call.attempt,
                     "attempts": [item.to_dict() for item in call.attempts],
                     "idempotency_key": call.idempotency_key,
+                    "timeout": call.timeout,
+                    "timeout_mode": call.timeout_mode,
                     "pending_retry": (
                         None if call.pending_retry is None else call.pending_retry.to_dict()
                     ),
@@ -387,12 +477,13 @@ class Execution:
         *args: Any,
         retry_policy: RetryPolicy | None = None,
         idempotency_key: str | None = None,
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> Any:
         """Run a registered tool as one logical call, journalling every attempt.
 
         Emits ``ToolRequested`` once -- the logical call, with its stable
-        ``call_id`` and the resolved retry policy -- and then one start/outcome
+        ``call_id``, retry policy and deadline -- and then one start/outcome
         pair per attempt::
 
             ToolRequested
@@ -410,6 +501,45 @@ class Execution:
         :class:`~agent_runtime.exceptions.RetryableToolError` is retried by
         default; a permanent or an unexpected failure is recorded once and
         raised as :class:`ToolInvocationError` after it is durably recorded.
+
+        Timeouts (Milestone 4C)
+        ------------------------
+
+        ``timeout=`` sets a deadline for this call, in seconds, overriding the
+        tool's ``@tool(timeout=...)`` default::
+
+            execution.call("slow_tool", timeout=5.0)
+
+        The deadline is journalled on ``ToolRequested`` and enforced by actually
+        stopping the tool, never by measuring how long it took:
+
+        ========================== ====================================
+        ``async def`` tool         :func:`asyncio.wait_for` cancels it
+        ``def`` with ``cancel_token``  the token is flipped, then awaited
+        ``def`` without one        **refused** -- see below
+        ========================== ====================================
+
+        A plain synchronous tool is *rejected* rather than faked. Python cannot
+        terminate a running thread, so a wrapper that timed the call and then
+        said "timed out" would be claiming a stop that never happened; that
+        raises :class:`~agent_runtime.exceptions.UnsupportedTimeoutError` before
+        anything is journalled.
+
+        A timeout is its own outcome, journalled ``ToolTimedOut`` rather than
+        folded into ``ToolFailed``, and it is retried only when the policy says
+        so (``RetryPolicy(retry_on_timeout=True)``). It is also *never* retried
+        for a call carrying an idempotency key whose stop could not be enforced:
+        the side effect may have happened, so the key stays ``PENDING`` and the
+        execution reports ``RECOVERY_REQUIRED`` instead of running it again.
+
+        Cancellation (Milestone 4C)
+        ----------------------------
+
+        ``execution.cancel()`` requests cancellation of the whole execution.
+        A tool that declared ``cancel_token`` sees ``is_cancelled()`` /
+        ``raise_if_cancelled()``; the attempt is journalled ``ToolCancelled``
+        and **never** retried, because cancelling is a decision rather than a
+        fault.
 
         The attempt itself is handed to a
         :class:`~agent_runtime.runner.ToolRunner`. In ``NORMAL`` mode that runs
@@ -448,19 +578,28 @@ class Execution:
                 previous, unresolved attempt. The tool did not run.
             IdempotencyKeyFailedError: the key is recorded as ``FAILED``.
             ToolInvocationError: the tool itself failed for good.
+            ToolCancelledError: the attempt was cancelled.
+            ToolTimedOutError: the attempt ran out of time.
+            UnsupportedTimeoutError: the deadline cannot be enforced for this
+                tool. Raised before anything is journalled.
         """
         self._require_running("call a tool")
 
         # Resolve + validate before journalling: an unknown tool or a bad
         # argument list is a programming error, and nothing was attempted.
+        # The deadline is resolved here too, so an unenforceable one is refused
+        # before a call id exists rather than half way through an attempt.
         request = self._prepare_request(name, args, kwargs)
         policy = self._resolve_retry_policy(name, retry_policy)
+        deadline = self._resolve_timeout(request.tool, timeout)
         call_id = self._new_call_id()
         self._runner.begin_call(call_id, request)
 
         if idempotency_key is None:
-            self._emit_requested(request, call_id, policy)
-            return self._attempt_until_settled(request, call_id, policy, attempt=1)
+            self._emit_requested(request, call_id, policy, deadline=deadline)
+            return self._attempt_until_settled(
+                request, call_id, policy, deadline, attempt=1
+            )
 
         # The claim is committed before the tool runs, and deliberately outside
         # any transaction that could cover it: the external call is not
@@ -479,9 +618,43 @@ class Execution:
                 request, call_id, policy, idempotency_key, decision.result
             )
 
-        self._emit_requested(request, call_id, policy, idempotency_key=idempotency_key)
+        self._emit_requested(
+            request, call_id, policy, deadline=deadline, idempotency_key=idempotency_key
+        )
         try:
-            result = self._attempt_until_settled(request, call_id, policy, attempt=1)
+            result = self._attempt_until_settled(
+                request,
+                call_id,
+                policy,
+                deadline,
+                attempt=1,
+                # Threaded through so an *unenforced* timeout on a keyed call
+                # knows there is a side effect at risk, and refuses to retry.
+                idempotency_key=idempotency_key,
+            )
+        except AmbiguousTimeoutError:
+            # The tool outlived its deadline and the runtime cannot prove it
+            # stopped, so the external effect may well have happened. The key is
+            # deliberately left PENDING: recording FAILED would let the next
+            # process believe the effect did not occur, which is precisely the
+            # guess this runtime refuses to make.
+            raise
+        except ToolTimedOutError as exc:
+            # A timeout the runtime *can* prove stopped is different. A coroutine
+            # cancelled at its await really did stop, so the side effect did not
+            # complete and FAILED is a known outcome rather than an ambiguity --
+            # leaving the key PENDING here would invent a recovery problem that
+            # nobody has, and block a legitimate retry behind it.
+            if exc.enforced:
+                self._idempotency.record_outcome(
+                    idempotency_key, error=describe_error(exc)
+                )
+            raise
+        except ToolCancelledError:
+            # Same reasoning as an unenforced timeout: a cancelled attempt was
+            # interrupted, not completed, and nobody has said the effect did not
+            # happen.
+            raise
         except Exception as exc:
             # A recorded failure is a known outcome, so the key can be settled as
             # FAILED. Only Exception, never BaseException: a KeyboardInterrupt or a
@@ -497,13 +670,15 @@ class Execution:
         call_id: str,
         policy: RetryPolicy,
         *,
+        deadline: ResolvedTimeout | None = None,
         idempotency_key: str | None = None,
         deduplicated: bool = False,
     ) -> None:
         """Journal ``ToolRequested``: one logical call, and its fixed identity.
 
-        The idempotency key goes in here and nowhere else, so the whole attempt
-        history -- and every replay of it -- hangs off one key.
+        The idempotency key and the deadline both go in here and nowhere else,
+        so the whole attempt history -- and every replay of it -- hangs off one
+        claim and one deadline, no matter how many attempts get made.
         """
         payload: dict[str, Any] = {
             "call_id": call_id,
@@ -514,6 +689,17 @@ class Execution:
             # after the process that used it is gone.
             "retry_policy": policy.to_dict(),
         }
+        if deadline is not None and deadline.active:
+            # The deadline, and the mechanism that will enforce it. Both are
+            # durable here so a resumed retry or a replay reuses the same rule
+            # instead of re-deriving it from a tool that may have changed.
+            #
+            # Only written when there *is* a deadline: a call with no timeout
+            # then produces exactly the ``ToolRequested`` Milestone 4A wrote, so
+            # old and new journals stay directly comparable and an old one
+            # replays byte for byte.
+            payload["timeout"] = deadline.seconds
+            payload["timeout_mode"] = str(deadline.mode)
         if idempotency_key is not None:
             payload["idempotency_key"] = idempotency_key
         if deduplicated:
@@ -573,6 +759,8 @@ class Execution:
             InvalidStateTransitionError: the call has no scheduled retry, or the
                 execution has already finished.
             ToolInvocationError: this attempt failed for good.
+            ToolTimedOutError: this attempt ran out of time.
+            ToolCancelledError: the execution was cancelled before it started.
         """
         self._require_running(f"continue the retry of tool call {call_id!r}")
         call = next((c for c in self.tool_calls if c.call_id == call_id), None)
@@ -591,8 +779,35 @@ class Execution:
             request,
             call_id,
             self._policy_of_call(call_id),
+            # The deadline is read back from the call's own ``ToolRequested``
+            # rather than re-resolved: the attempt has to run under the same
+            # rule the crashed process was using, or the recovered history
+            # would describe a different call than the one that happened.
+            self._timeout_of_call(call_id),
             attempt=call.pending_retry.attempt,
+            idempotency_key=call.idempotency_key,
         )
+
+    def _timeout_of_call(self, call_id: str) -> ResolvedTimeout:
+        """The deadline a past call was journalled with, read from its request.
+
+        The deadline has to come from durable data for the same reason the
+        retry policy does: the object that resolved it is long gone, and
+        re-deriving it from today's tool definition could silently enforce a
+        different rule than the one the journal describes.
+        """
+        for event in reversed(self.events):
+            if (
+                event.event_type is EventType.TOOL_REQUESTED
+                and event.payload.get("call_id") == call_id
+            ):
+                return ResolvedTimeout.from_dict(
+                    {
+                        "timeout": event.payload.get("timeout"),
+                        "timeout_mode": event.payload.get("timeout_mode"),
+                    }
+                )
+        return ResolvedTimeout()
 
     def _resolve_retry_policy(
         self, name: str, call_policy: RetryPolicy | None
@@ -610,6 +825,26 @@ class Execution:
             if declared is not None:
                 return declared
         return NO_RETRY
+
+    def _resolve_timeout(
+        self, name: str, call_timeout: float | None
+    ) -> ResolvedTimeout:
+        """The deadline this call runs under: call-level, then tool-level, then none.
+
+        The call-level value wins outright, for the same reason a call-level
+        retry policy does: it is the more specific statement about this one
+        invocation. A deadline the runtime cannot actually enforce is refused
+        here, before ``ToolRequested`` -- a call that cannot honour its own
+        deadline should not get a call id at all.
+        """
+        if self._registry is None:
+            return ResolvedTimeout(seconds=check_timeout(call_timeout), mode=TimeoutMode.UNSUPPORTED)
+        target = self._registry.get(name)
+        if call_timeout is not None:
+            seconds = check_timeout(call_timeout, where=f"timeout for call to {name!r}")
+        else:
+            seconds = target.timeout
+        return resolve_timeout(target.func, seconds, tool_name=target.name)
 
     def _policy_of_call(self, call_id: str) -> RetryPolicy:
         """The policy a past call was journalled with, read back from its request.
@@ -630,16 +865,43 @@ class Execution:
         request: ToolRequest,
         call_id: str,
         policy: RetryPolicy,
+        deadline: ResolvedTimeout,
         *,
         attempt: int,
+        idempotency_key: str | None = None,
     ) -> Any:
         """Run the attempts of one logical call until it settles; return its result.
 
         Each attempt is journalled before it happens and its outcome after, and
         a retry is journalled before the wait -- so the journal always describes
         exactly as much as the process actually did, no matter when it died.
+
+        Three stops, three events, three rules (Milestone 4C):
+
+        * a **failure** may be retried, per the policy;
+        * a **timeout** may be retried only when the policy opted in, and never
+          when the call carries an idempotency key whose stop could not be
+          enforced -- there the side effect may have happened, so the key is
+          left alone and the call ends;
+        * a **cancellation** is never retried, and it also interrupts the wait
+          before the next attempt rather than sleeping it out.
         """
         while True:
+            if self._cancel_token.is_cancelled():
+                # Cancellation arrived between attempts (during a backoff, or
+                # while a sibling call was stopping). The call settles as
+                # cancelled without ever being attempted -- a retry here would
+                # re-issue a decision the application already made.
+                self._finish_cancelled(
+                    call_id,
+                    request.tool,
+                    attempt,
+                    reason=self._cancel_token.reason,
+                )
+                raise self._cancelled_error(
+                    call_id, request.tool, self._cancel_token.reason, attempt
+                )
+
             if not self._runner.can_attempt(call_id, attempt):
                 # Only a replay gets here: the recorded history ends between the
                 # scheduled retry and its attempt, so there is nothing to serve
@@ -651,9 +913,23 @@ class Execution:
                 EventType.TOOL_STARTED,
                 {"call_id": call_id, "tool": request.tool, "attempt": attempt},
             )
-            outcome = self._runner.run(request)
+            outcome = self._runner.run(
+                request, timeout=deadline, token=self._cancel_token
+            )
 
             if outcome.succeeded:
+                # A tool that returned *because* it was stopped must not have its
+                # result recorded. ``cancel()`` from another thread can land
+                # between the tool finishing and this line, and a
+                # ``ToolCompleted`` written afterwards would silently undo a
+                # durable ``ToolCancelled`` -- the call would look successful
+                # while the execution says CANCELLED. The token is the authority
+                # on whether this attempt was stopped, not the return value.
+                if self._cancel_token.is_cancelled():
+                    self._finish_cancelled(call_id, request.tool, attempt)
+                    raise self._cancelled_error(
+                        call_id, request.tool, self._cancel_token.reason, attempt
+                    )
                 self._append(
                     EventType.TOOL_COMPLETED,
                     {
@@ -664,6 +940,34 @@ class Execution:
                     },
                 )
                 return outcome.result
+
+            if outcome.cancelled:
+                # Journalled as ToolCancelled -- never as a failure. Cancellation
+                # is a decision, and the journal has to say so plainly enough
+                # that a recovery leaves it alone instead of retrying it.
+                self._finish_cancelled(
+                    call_id,
+                    request.tool,
+                    attempt,
+                    reason=(outcome.error or {}).get("message"),
+                )
+                error = self._runner.invocation_error(request, outcome)
+                error.call_id = call_id
+                error.attempts = attempt
+                if outcome.cause is not None:
+                    raise error from outcome.cause
+                raise error
+
+            if outcome.timed_out:
+                return self._after_timeout(
+                    request,
+                    call_id,
+                    policy,
+                    deadline,
+                    attempt,
+                    outcome,
+                    idempotency_key,
+                )
 
             self._append(
                 EventType.TOOL_FAILED,
@@ -686,17 +990,195 @@ class Execution:
                     raise error from outcome.cause
                 raise error
 
-            self._schedule_retry(call_id, request.tool, decision)
+            if not self._schedule_retry(call_id, request.tool, decision):
+                # Cancelled during the backoff (§9). The wait was interrupted
+                # and the decision is durable, so the call settles as cancelled
+                # rather than continuing to a retry nobody wants any more.
+                return self._after_cancellation_during_backoff(
+                    call_id, request.tool, decision
+                )
             attempt = decision.attempt
+
+    def _after_timeout(
+        self,
+        request: ToolRequest,
+        call_id: str,
+        policy: RetryPolicy,
+        deadline: ResolvedTimeout,
+        attempt: int,
+        outcome: Any,
+        idempotency_key: str | None,
+    ) -> Any:
+        """Journal ``ToolTimedOut`` and decide whether another attempt follows.
+
+        The idempotency check is why this is a method and not a few lines in the
+        loop. A timeout whose stop was *not* enforced means the external effect
+        may have happened while the runtime was trying to stop a thread.
+        Retrying would perform the side effect a second time, so the runtime
+        stops here and leaves the key ``PENDING``: the ambiguity is reported,
+        not resolved.
+        """
+        self._append(
+            EventType.TOOL_TIMED_OUT,
+            {
+                "call_id": call_id,
+                "tool": request.tool,
+                "attempt": attempt,
+                "error": dict(outcome.error or {}),
+                # The three facts that make a timeout readable after a restart.
+                "timeout": outcome.timeout,
+                "timeout_mode": outcome.timeout_mode,
+                "enforced": outcome.timeout_enforced,
+            },
+        )
+
+        if outcome.ambiguous and idempotency_key is not None:
+            inner = self._runner.invocation_error(request, outcome)
+            inner.call_id = call_id
+            inner.attempts = attempt
+            raise AmbiguousTimeoutError(
+                f"Tool {request.tool!r} timed out and the runtime could not stop it, "
+                f"so the side effect of idempotency key {idempotency_key!r} may already "
+                "have happened. The call was not retried. Check what actually "
+                "happened and settle the key with resolve_idempotency(...).",
+                idempotency_key=idempotency_key,
+                tool_name=request.tool,
+            ) from inner
+
+        decision = self._runner.retry_decision(
+            request, outcome, call_id=call_id, attempt=attempt, policy=policy
+        )
+        if decision is None:
+            error = self._runner.invocation_error(request, outcome)
+            error.call_id = call_id
+            error.attempts = attempt
+            if outcome.cause is not None:
+                raise error from outcome.cause
+            raise error
+
+        if not self._schedule_retry(call_id, request.tool, decision):
+            return self._after_cancellation_during_backoff(
+                call_id, request.tool, decision
+            )
+        return self._attempt_until_settled(
+            request,
+            call_id,
+            policy,
+            deadline,
+            attempt=decision.attempt,
+            idempotency_key=idempotency_key,
+        )
+
+    def _finish_cancelled(
+        self, call_id: str, tool: str, attempt: int, *, reason: Any = None
+    ) -> None:
+        """Settle a call as cancelled, exactly once.
+
+        Idempotent per call on purpose. ``cancel()`` runs on the cancelling
+        thread and journals ``ToolCancelled`` for whichever call is open, while
+        the call itself is still running and will reach its own cancellation a
+        moment later. Two events for one stop would make the history describe
+        something that did not happen -- and would let a replay serve an attempt
+        that the journal already settled.
+        """
+        if self._is_settled_as_cancelled(call_id):
+            return
+        self._settle_cancelled(call_id, tool, attempt=attempt, reason=reason)
+
+    def _is_settled_as_cancelled(self, call_id: str) -> bool:
+        """Whether this call already has its durable ``ToolCancelled``."""
+        for event in reversed(self.events):
+            if (
+                event.event_type is EventType.TOOL_CANCELLED
+                and event.payload.get("call_id") == call_id
+            ):
+                return True
+        return False
+
+    def _settle_cancelled(
+        self, call_id: str, tool: str, *, attempt: int, reason: Any = None
+    ) -> None:
+        """Journal ``ToolCancelled`` for an attempt that was stopped on purpose.
+
+        The event is a first-class fact rather than a ``ToolFailed`` with a
+        message: it is what tells recovery that this call must not be resumed,
+        and what tells a replay not to invent a result for it.
+        """
+        note = make_jsonable(reason)
+        self._append(
+            EventType.TOOL_CANCELLED,
+            {
+                "call_id": call_id,
+                "tool": tool,
+                "attempt": attempt,
+                "reason": note,
+                "error": {
+                    "type": "ToolCancelledError",
+                    "message": note or "cancelled",
+                    "traceback": None,
+                },
+            },
+        )
+
+    def _cancelled_error(
+        self, call_id: str, tool: str, reason: Any, attempt: int = 0
+    ) -> ToolCancelledError:
+        """The cancellation error a caller sees, with the call it belongs to.
+
+        ``attempts`` is the number the logical call had made, so a caller
+        catching this has the same information a caller catching
+        :class:`ToolInvocationError` gets from a failure.
+        """
+        error = ToolCancelledError(
+            f"Tool {tool!r} was not attempted: execution {self._id!r} was cancelled",
+            reason=reason,
+            tool_name=tool,
+            call_id=call_id,
+            attempts=attempt,
+        )
+        error.call_id = call_id
+        error.attempts = attempt
+        return error
+
+    def _after_cancellation_during_backoff(
+        self, call_id: str, tool: str, decision: RetryDecision
+    ) -> Any:
+        """Settle a call whose scheduled retry was cancelled before it ran.
+
+        The retry was already journalled, so the history says a retry *was*
+        scheduled; cancellation then says it will not happen. Both are durable
+        and the reducers read the second as the final word, so the call ends
+        ``CANCELLED`` with no attempt recorded -- exactly what happened. The
+        consumed pending slot is gone with it, so nothing can resume it.
+        """
+        # ``failed_attempt``, not ``attempt``: the attempt the cancelled decision
+        # named never started, so the journal has no ``ToolStarted`` for it, and
+        # recording it would put a phantom attempt in the folded state.
+        self._finish_cancelled(
+            call_id,
+            tool,
+            decision.failed_attempt or 1,
+            reason=self._cancel_token.reason,
+        )
+        # ``attempts`` likewise means how many were *made*.
+        raise self._cancelled_error(
+            call_id, tool, self._cancel_token.reason, decision.failed_attempt or 1
+        )
 
     def _schedule_retry(
         self, call_id: str, tool: str, decision: RetryDecision
-    ) -> None:
-        """Journal the retry decision, then wait for it.
+    ) -> bool:
+        """Journal the retry decision, then wait for it; ``False`` if cancelled.
 
         The order is the point: ``ToolRetryScheduled`` is committed *before* the
         sleep, so a process that dies while waiting leaves the decision
         recoverable instead of losing it with the sleep.
+
+        Milestone 4C: the wait itself goes through the sleeper's
+        ``interruptible_sleep``, so a cancellation that arrives during a
+        ten-second backoff ends it immediately rather than being noticed ten
+        seconds later. The ``False`` return is what the caller uses to stop
+        instead of starting the attempt the decision named.
         """
         self._append(
             EventType.TOOL_RETRY_SCHEDULED,
@@ -710,7 +1192,9 @@ class Execution:
                 "error": dict(decision.error or {}),
             },
         )
-        self._sleeper.sleep(decision.delay)
+        return not wait_interrupted(
+            self._sleeper, decision.delay, self._cancel_token
+        )
 
     def complete(self, result: Any = None) -> None:
         """Mark the execution COMPLETED and journal ``ExecutionCompleted``.
@@ -748,6 +1232,79 @@ class Execution:
         self._require_active("cancel")
         self._append(EventType.EXECUTION_CANCELLED, {"result": make_jsonable(reason)})
         self._maybe_auto_checkpoint()
+
+    def cancel(self, reason: Any = None) -> None:
+        """Request cancellation of this execution, durably and at once.
+
+        Milestone 4C's cancellation entry point, and the one place the decision
+        becomes a fact::
+
+            execution.cancel("user pressed stop")
+
+        What happens, in order:
+
+        1. the execution's :attr:`cancel_token` is flipped, so a tool that is
+           blocked right now is interrupted -- and so is a retry backoff, which
+           is waited on that token and therefore stops immediately rather than
+           sleeping out its remaining seconds;
+        2. ``ToolCancelled`` is journalled for any call whose attempt is
+           currently open, if there is one;
+        3. ``ExecutionCancelled`` is journalled, so the decision survives the
+           process.
+
+        Because step 3 is durable, a restart reports ``CANCELLED`` and does
+        nothing else: a cancelled execution is not resumed, and its cancelled
+        call is not retried. See :attr:`RecoveryState` for how that is
+        classified.
+
+        Safe to call from another thread -- that is the usual case, since the
+        thread being cancelled is the one inside the tool. Safe to call twice:
+        the second call finds the token already cancelled and journals nothing
+        new, so a history never grows two ``ExecutionCancelled`` events for one
+        decision.
+
+        Args:
+            reason: Why. Recorded on ``ToolCancelled`` and ``ExecutionCancelled``
+                so a reader can tell a deliberate stop from a timeout.
+
+        Raises:
+            InvalidStateTransitionError: the execution already finished as
+                something other than ``CANCELLED``.
+        """
+        if self.state.status is ExecutionStatus.CANCELLED:
+            # Already cancelled, durably. A second ``cancel()`` must not append
+            # a second cancellation -- the decision is the same decision.
+            self._cancel_token.cancel(reason)
+            return
+        self._require_active("cancel")
+        already = self._cancel_token.cancel(reason)
+        if not already:
+            # Cancelled by an in-flight call's own deadline or an earlier
+            # ``cancel()`` on this object; the journal has been written.
+            return
+        open_call = self._open_call()
+        if open_call is not None:
+            self._finish_cancelled(
+                open_call.call_id,
+                open_call.tool,
+                max(open_call.attempt, 1),
+                reason=reason,
+            )
+        self._append(EventType.EXECUTION_CANCELLED, {"result": make_jsonable(reason)})
+        self._maybe_auto_checkpoint()
+
+    def _open_call(self) -> ToolCall | None:
+        """The call whose attempt is currently open, if any.
+
+        "Open" means started and not yet settled -- the one a cancellation has
+        to stop. A call that already completed, timed out or failed is not open,
+        and neither is one that is merely waiting on a retry, because that
+        attempt has not started.
+        """
+        return next(
+            (call for call in self.state.tool_calls if call.status.is_incomplete and call.status is ToolCallStatus.STARTED),
+            None,
+        )
 
     # -- checkpoints ---------------------------------------------------------
 

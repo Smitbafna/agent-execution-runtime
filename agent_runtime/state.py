@@ -33,6 +33,7 @@ __all__ = [
     "ToolCall",
     "IncompleteTool",
     "ExecutionState",
+    "RecoveryState",
     "TERMINAL_STATUSES",
     "INCOMPLETE_TOOL_STATUSES",
     "initial_state",
@@ -41,6 +42,7 @@ __all__ = [
     "detect_incomplete_tools",
     "detect_pending_retries",
     "resolve_status",
+    "classify_recovery",
     "finalize_state",
     "replace_state",
 ]
@@ -73,11 +75,34 @@ class ToolCallStatus(StrEnum):
     #: consumes it.
     RETRYING = "RETRYING"
     CANCELLED = "CANCELLED"
+    #: An attempt's deadline expired (Milestone 4C). Deliberately *not*
+    #: ``FAILED``: a timeout says the call ran out of time, and an application
+    #: reading a recovered state has to be able to tell that from "the tool
+    #: raised" without inspecting a message. It is a settled status -- the
+    #: journal recorded what happened -- so it is not an ambiguity either; what
+    #: the attempt's ``error.enforced`` flag says is whether the side effect
+    #: itself is known to have stopped.
+    TIMED_OUT = "TIMED_OUT"
 
     @property
     def is_incomplete(self) -> bool:
         """True while the journal still says nothing about the outcome."""
         return self in INCOMPLETE_TOOL_STATUSES
+
+    @property
+    def is_stop(self) -> bool:
+        """True for the three ways a call ends without a result.
+
+        Milestone 4C: failure, timeout and cancellation are deliberately three
+        statuses rather than one. This predicate exists for the code that wants
+        "the call ended badly" without caring which -- never for a decision
+        that depends on the difference.
+        """
+        return self in (
+            ToolCallStatus.FAILED,
+            ToolCallStatus.TIMED_OUT,
+            ToolCallStatus.CANCELLED,
+        )
 
 
 #: Statuses that mean the execution has finished, one way or another.
@@ -259,11 +284,36 @@ class ToolCall:
     #: the tool -- is visible in the reconstructed state exactly like any other
     #: call, and a replay reproduces the same field.
     idempotency_key: str | None = None
+    #: The deadline this call was journalled with, in seconds (Milestone 4C),
+    #: and the mode that enforces it. Recorded on ``ToolRequested`` so the
+    #: value survives a crash, and round-trips through a checkpoint with the
+    #: rest of the state. ``None`` for a call with no deadline.
+    timeout: float | None = None
+    timeout_mode: str | None = None
 
     @property
     def attempt_count(self) -> int:
         """How many attempts this call made."""
         return len(self.attempts)
+
+    @property
+    def timed_out(self) -> bool:
+        """Whether this call's final attempt ran out of time."""
+        return self.status is ToolCallStatus.TIMED_OUT
+
+    @property
+    def timeout_enforced(self) -> bool | None:
+        """Whether a timed-out call's tool provably stopped, or ``None``.
+
+        ``False`` is the answer that matters after a restart: the runtime asked
+        a thread to stop and it did not, so whatever external effect it was
+        performing may still have happened -- and that is what makes such a
+        call with an idempotency key a ``RECOVERY_REQUIRED`` rather than a
+        failure.
+        """
+        if self.status is not ToolCallStatus.TIMED_OUT:
+            return None
+        return bool((self.error or {}).get("enforced", True))
 
     def attempt_record(self, number: int) -> ToolAttempt | None:
         """The recorded attempt ``number``, or ``None`` if it never happened."""
@@ -281,6 +331,9 @@ class ToolCall:
             return f"{self.tool}({args}) {self.pending_retry}"
         if self.status is ToolCallStatus.CANCELLED:
             return f"{self.tool}({args}) -- cancelled"
+        if self.status is ToolCallStatus.TIMED_OUT:
+            note = "" if self.timeout_enforced else " (stop NOT enforced)"
+            return f"{self.tool}({args}) -- timed out after {self.timeout}s{note}"
         return f"{self.tool}({args}) [{self.status}]"
 
     def to_dict(self) -> dict[str, Any]:
@@ -299,6 +352,8 @@ class ToolCall:
             "attempts": [item.to_dict() for item in self.attempts],
             "pending_retry": None if self.pending_retry is None else self.pending_retry.to_dict(),
             "idempotency_key": self.idempotency_key,
+            "timeout": self.timeout,
+            "timeout_mode": self.timeout_mode,
         }
 
     @classmethod
@@ -321,6 +376,8 @@ class ToolCall:
             ),
             pending_retry=None if pending is None else PendingRetry.from_dict(pending),
             idempotency_key=data.get("idempotency_key"),
+            timeout=data.get("timeout"),
+            timeout_mode=data.get("timeout_mode"),
         )
 
 
@@ -540,6 +597,10 @@ def _on_tool_requested(state: ExecutionState, event: Event) -> ExecutionState:
         # therefore for every one of its attempts. Journals written before it
         # carry no key, and the field simply stays None.
         idempotency_key=event.payload.get("idempotency_key"),
+        # Milestone 4C: the same for the deadline -- fixed once, for the call,
+        # so a resumed retry reuses it instead of re-deciding.
+        timeout=event.payload.get("timeout"),
+        timeout_mode=event.payload.get("timeout_mode"),
     )
     return replace(state, execution_id=event.execution_id, tool_calls=state.tool_calls + (call,))
 
@@ -622,12 +683,44 @@ def _on_tool_retry_scheduled(state: ExecutionState, event: Event) -> ExecutionSt
 
 
 def _on_tool_cancelled(state: ExecutionState, event: Event) -> ExecutionState:
-    return _settle_call(
+    """Settle a call as cancelled, and drop any retry it had scheduled.
+
+    Folding like any other settled attempt -- so a cancelled attempt appears in
+    the attempt history, which is what lets a replay reproduce it rather than
+    treating the call as unfinished -- and then clearing ``pending_retry``.
+
+    That clearing is the part that matters after a restart: a call cancelled
+    *during* a backoff has a ``ToolRetryScheduled`` behind it, and leaving that
+    slot populated would let a resume "continue" an attempt the application had
+    already decided against. §10, expressed in the reducer.
+    """
+    settled = _settle_call(
         state,
         event,
         ToolCallStatus.CANCELLED,
         error=event.payload.get("error") or {},
     )
+    return _update_call(settled, event, pending_retry=None)
+
+
+def _on_tool_timed_out(state: ExecutionState, event: Event) -> ExecutionState:
+    """Record an attempt that ran out of time (Milestone 4C).
+
+    Folds like any other settled attempt, but keeps the three things that make
+    a timeout readable afterwards: the deadline, the mechanism that was going
+    to enforce it, and whether the runtime can prove the tool actually stopped.
+    That last flag is what makes an unenforceable cooperative timeout an
+    *ambiguity* about the side effect, without turning the call itself into an
+    unfinished one.
+    """
+    error = dict(event.payload.get("error") or {})
+    if "timeout" in event.payload:
+        error.setdefault("timeout", event.payload["timeout"])
+    if "timeout_mode" in event.payload:
+        error.setdefault("timeout_mode", event.payload["timeout_mode"])
+    if "enforced" in event.payload:
+        error.setdefault("enforced", bool(event.payload["enforced"]))
+    return _settle_call(state, event, ToolCallStatus.TIMED_OUT, error=error)
 
 
 # -- attempt bookkeeping ---------------------------------------------------
@@ -737,6 +830,7 @@ _REDUCERS: dict[EventType, Any] = {
     EventType.TOOL_FAILED: _on_tool_failed,
     EventType.TOOL_RETRY_SCHEDULED: _on_tool_retry_scheduled,
     EventType.TOOL_CANCELLED: _on_tool_cancelled,
+    EventType.TOOL_TIMED_OUT: _on_tool_timed_out,
 }
 
 
@@ -781,6 +875,73 @@ def resolve_status(state: ExecutionState) -> ExecutionStatus:
     if state.status is ExecutionStatus.RUNNING and detect_incomplete_tools(state):
         return ExecutionStatus.RECOVERY_REQUIRED
     return state.status
+
+
+class RecoveryState(StrEnum):
+    """What a restarted process should do about an execution (Milestone 4C).
+
+    :attr:`ExecutionStatus` says what the journal *is*; this says what that
+    means for whoever is holding the baton. The distinction matters because
+    ``RUNNING`` covers three very different situations, and Milestone 4C makes
+    all three reachable:
+
+    * a retry was scheduled and not yet run -- unambiguous, carry it on;
+    * an external effect may have happened -- ambiguous, ask a human;
+    * nothing is outstanding -- ordinary, carry on.
+
+    Guessing between them is exactly what this runtime has refused to do since
+    Milestone 2, so the classification is derived from events and never stored.
+    """
+
+    #: The history recorded a successful end.
+    COMPLETED = "COMPLETED"
+    #: The history recorded a deliberate failure.
+    FAILED = "FAILED"
+    #: The history recorded a deliberate cancellation. Stays cancelled: a
+    #: cancelled execution does not resume, and nothing retries it.
+    CANCELLED = "CANCELLED"
+    #: A retry was scheduled and has not started. Not ambiguous -- the journal
+    #: says exactly which attempt comes next -- so the new process can carry it
+    #: on with ``continue_pending_retry``.
+    RETRYABLE = "RETRYABLE"
+    #: Something's outcome the journal does not record: an open tool call, or an
+    #: idempotency key whose external effect may have happened without the
+    #: runtime learning it. Needs an explicit decision; nothing is re-run.
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+    #: Ordinary in-flight work with nothing outstanding. Not a special state --
+    #: it is listed so the classification is total rather than partial.
+    RUNNING = "RUNNING"
+
+
+def classify_recovery(
+    state: ExecutionState, *, unresolved_keys: bool = False
+) -> RecoveryState:
+    """Classify what a restart should do with ``state``.
+
+    Args:
+        state: The recovered state.
+        unresolved_keys: Whether the idempotency store holds a key for this
+            execution with no recorded outcome. Passed in rather than read
+            here because those rows live in SQLite, not in the journal, and this
+            module knows nothing about storage.
+
+    The order is the point. A recorded terminal decision is returned as it
+    stands -- a cancelled execution stays ``CANCELLED`` even if some call in the
+    same history never settled, because the cancellation was deliberate and
+    overriding it would be a guess. Only then does ambiguity win over a pending
+    retry, because an ambiguity must be answered before anything else proceeds.
+    """
+    if state.status is ExecutionStatus.COMPLETED:
+        return RecoveryState.COMPLETED
+    if state.status is ExecutionStatus.FAILED:
+        return RecoveryState.FAILED
+    if state.status is ExecutionStatus.CANCELLED:
+        return RecoveryState.CANCELLED
+    if state.status is ExecutionStatus.RECOVERY_REQUIRED or unresolved_keys:
+        return RecoveryState.RECOVERY_REQUIRED
+    if detect_pending_retries(state):
+        return RecoveryState.RETRYABLE
+    return RecoveryState.RUNNING
 
 
 def finalize_state(state: ExecutionState) -> ExecutionState:

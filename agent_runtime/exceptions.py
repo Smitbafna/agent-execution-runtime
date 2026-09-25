@@ -32,6 +32,11 @@ __all__ = [
     "RetryableToolError",
     "PermanentToolError",
     "RetryConfigurationError",
+    "ToolTimeoutError",
+    "ToolCancelledError",
+    "TimeoutConfigurationError",
+    "UnsupportedTimeoutError",
+    "TimeoutEnforcementError",
     "UnknownToolCallError",
     "InvalidRecoveryActionError",
     "StateReconstructionError",
@@ -181,6 +186,153 @@ class RetryConfigurationError(AgentRuntimeError):
     an impossible ``max_attempts`` or a backoff that is not a policy is a
     programming error, and finding it out at call time would be too late.
     """
+
+
+# ---------------------------------------------------------------------------
+# Timeouts and cancellation (Milestone 4C)
+# ---------------------------------------------------------------------------
+
+
+class TimeoutError(AgentRuntimeError):
+    """Base class for everything that stops a tool call short of its result.
+
+    A timeout and a cancellation are both *a stop the tool did not ask for*,
+    and both are distinct from an ordinary failure: the distinction is kept
+    in three separate subclasses (and three separate events) so no reader
+    has to read a message to tell them apart.
+    """
+
+
+class TimeoutConfigurationError(TimeoutError):
+    """A timeout value is not usable -- zero, negative, infinite or not a number.
+
+    Raised where the value is written, so a nonsensical deadline is reported on
+    the line that wrote it rather than during a call that mattered.
+    """
+
+
+class UnsupportedTimeoutError(TimeoutConfigurationError):
+    """A deadline was requested for a tool call the runtime cannot stop.
+
+    A synchronous function with no cancellation token cannot be interrupted:
+    Python has no safe way to terminate a running thread, and a wrapper that
+    merely *measured* elapsed time would report a stop that never happened.
+    The runtime refuses the call instead.
+
+    Attributes:
+        tool_name: The tool that cannot honour a deadline.
+        timeout: The deadline that was asked for, in seconds.
+        mode: The :class:`~agent_runtime.timeout.TimeoutMode` the tool resolved
+            to -- always :attr:`~agent_runtime.timeout.TimeoutMode.UNSUPPORTED`.
+    """
+
+    def __init__(
+        self,
+        summary: str,
+        *,
+        tool_name: str,
+        timeout: float,
+        mode: Any = None,
+    ) -> None:
+        super().__init__(summary)
+        self.tool_name = tool_name
+        self.timeout = timeout
+        self.mode = mode
+
+
+class TimeoutEnforcementError(TimeoutError):
+    """A cooperative deadline expired and the tool did not stop.
+
+    The honest report of a tool that was asked to stop and kept running: the
+    runtime did not terminate it, and will not claim that it did. The attempt
+    is journalled ``ToolTimedOut`` with ``enforced=False``, and a call with an
+    idempotency key is left ``PENDING`` so the possibly-happened side effect
+    stays visible as ``RECOVERY_REQUIRED``.
+
+    Attributes:
+        tool_name: The tool that outlived its deadline.
+        timeout: The deadline, in seconds.
+        grace: How long the runtime waited for the tool to notice.
+    """
+
+    def __init__(
+        self, summary: str, *, tool_name: str, timeout: float, grace: float
+    ) -> None:
+        super().__init__(summary)
+        self.tool_name = tool_name
+        self.timeout = timeout
+        self.grace = grace
+
+
+class ToolTimedOutError(ToolInvocationError, TimeoutError):
+    """A tool attempt stopped because its deadline expired.
+
+    Carries the failure of the attempt rather than hiding it in a generic
+    exception: :attr:`timeout` and :attr:`mode` say how long the tool was given
+    and how it was stopped, and :attr:`enforced` says whether the runtime can
+    prove the tool actually stopped.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tool_name: str | None = None,
+        timeout: float | None = None,
+        mode: str | None = None,
+        enforced: bool = True,
+        call_id: str | None = None,
+        attempts: int | None = None,
+        traceback_text: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            tool_name=tool_name,
+            call_id=call_id,
+            traceback_text=traceback_text,
+            attempts=attempts,
+        )
+        self.timeout = timeout
+        self.mode = mode
+        #: ``False`` means the runtime asked a thread to stop and it did not.
+        #: A side effect may therefore have happened anyway.
+        self.enforced = enforced
+
+
+#: The name the event and the journal payload use. ``ToolTimedOut`` is what the
+#: milestone calls the event, so the exception matches it rather than inventing
+#: a second spelling.
+ToolTimeoutError = ToolTimedOutError
+
+
+class ToolCancelledError(ToolInvocationError, TimeoutError):
+    """A tool attempt stopped because cancellation was requested.
+
+    Raised by :meth:`~agent_runtime.cancellation.CancellationToken.raise_if_cancelled`
+    inside a cooperative tool, and constructed by the runtime when it stops a
+    tool for a cancellation it was asked for. Cancellation is a deliberate
+    decision by the application, so it is never retried.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: Any = None,
+        tool_name: str | None = None,
+        call_id: str | None = None,
+        attempts: int | None = None,
+        traceback_text: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            tool_name=tool_name,
+            call_id=call_id,
+            traceback_text=traceback_text,
+            attempts=attempts,
+        )
+        self.reason = reason
+
 
 
 class UnknownToolCallError(AgentRuntimeError):

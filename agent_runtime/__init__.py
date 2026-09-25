@@ -1,36 +1,47 @@
-"""Agent Execution Runtime -- Milestone 4B: idempotency, crash-safe side effects.
+"""Agent Execution Runtime -- Milestone 4C: timeouts, cancellation, reliability.
 
 The invariant this milestone adds:
 
-    A side-effecting tool never runs twice for one idempotency key unless the
-    application explicitly asks for it, and every key whose outcome the runtime
-    does not know is reported rather than guessed at.
+    A timeout stops the tool or the runtime says it could not; a cancellation is
+    a decision, never a retry; and an ambiguous side effect is reported rather
+    than resolved by a guess.
 
 Quick start::
 
     from agent_runtime import Runtime
 
     with Runtime("agent.db") as runtime:
-        execution = runtime.start(goal="Welcome the new user")
-        execution.call(
-            "send_email",
-            to="user@example.com",
-            body="welcome!",
-            idempotency_key="welcome-user-123",   # <-- the guard
-        )
+        execution = runtime.start(goal="Process the batch")
+        execution.call("slow_tool", timeout=5.0)      # a real deadline
+        execution.cancel("user pressed stop")        # a durable decision
 
-If that process dies between the claim and the outcome, the key survives as
-``PENDING`` and the next process refuses to send the email again::
+A deadline is enforced by actually stopping the tool -- ``asyncio.wait_for`` for
+a coroutine, a cancellation token for a ``def`` tool that declared one -- and
+*refused* for a ``def`` tool that did not, because Python cannot terminate a
+thread and a wrapper that merely measured elapsed time would be reporting a stop
+that never happened::
 
-    execution = runtime.resume(execution_id)
-    print(execution.status)                 # RECOVERY_REQUIRED
-    print(execution.unresolved_idempotency) # the keys it cannot answer for
+    UnsupportedTimeoutError: Cannot enforce a 1.0s timeout on tool 'unstoppable':
+    it is a synchronous function with no cancellation token, and Python cannot
+    terminate a running thread. Write it as 'async def' so a deadline can cancel
+    it, or declare a 'cancel_token' parameter so the runtime can ask it to stop.
 
-    execution.resolve_idempotency("welcome-user-123", action="mark_completed",
-                                  result={"message_id": "abc"})  # I checked: it sent
-    execution.resolve_idempotency("welcome-user-123", action="retry")          # or run once more
+Cancellation is durable and safe to call from another thread, and a cancelled
+execution is never resumed and never retried::
 
-Milestone 4A's invariant still holds, and is what makes retries of a keyed call
+    ToolStarted -> ToolCancelled -> ExecutionCancelled
+
+A timeout joins the reliability model without collapsing into a failure, and
+without bypassing the idempotency guarantee. ``ToolTimedOut`` records whether
+the runtime could *prove* the tool stopped, and that one flag is what decides
+whether a keyed call is a known ``FAILED`` outcome or an ambiguity::
+
+    tool starts -> a timeout the runtime could not enforce
+        -> the side effect may have happened
+        -> the key stays PENDING, the execution reports RECOVERY_REQUIRED
+        -> an explicit resolve_idempotency, never a retry and never a guess
+
+Milestone 4B's invariant still holds, and is what makes retries of a keyed call
 safe::
 
     A logical tool call keeps one stable call_id while it may make several
@@ -43,7 +54,8 @@ recoverable:
     A recovered execution represents a valid state derived from a consistent
     checkpoint plus the events that were durably persisted after it.
 
-And the limit is stated plainly, because no amount of bookkeeping removes it:
+And the limit is still stated plainly, because no amount of bookkeeping removes
+it:
 
     This runtime does not provide exactly-once execution of external side
     effects. SQLite cannot commit atomically with an HTTP request, so a key left
@@ -54,6 +66,7 @@ And the limit is stated plainly, because no amount of bookkeeping removes it:
 
 from __future__ import annotations
 
+from .cancellation import CANCEL_TOKEN_PARAMETER, CancellationToken
 from .events import Event, EventType, describe_error
 from .exceptions import (
     AgentRuntimeError,
@@ -69,11 +82,12 @@ from .exceptions import (
     ToolAlreadyRegisteredError,
     ToolArgumentError,
     ToolCallError,
+    ToolCancelledError,
     ToolError,
     ToolInvocationError,
     ToolNotFoundError,
 )
-from .execution import Execution
+from .execution import AmbiguousTimeoutError, Execution
 from .journal import EventJournal
 from .exceptions import (
     AgentRuntimeError,
@@ -103,9 +117,16 @@ from .exceptions import (
     ToolAlreadyRegisteredError,
     ToolArgumentError,
     ToolCallError,
+    ToolCancelledError,
     ToolError,
     ToolInvocationError,
     ToolNotFoundError,
+    ToolTimedOutError,
+    ToolTimeoutError,
+    TimeoutConfigurationError,
+    TimeoutEnforcementError,
+    TimeoutError,
+    UnsupportedTimeoutError,
     UnknownIdempotencyKeyError,
     UnknownToolCallError,
 )
@@ -141,6 +162,7 @@ from .retry import (
     RetryPolicy,
     Sleeper,
     classify_error,
+    wait_interrupted,
 )
 from .runner import ToolOutcome, ToolRequest, ToolRunner, ToolRunnerMode
 from .runtime import Runtime
@@ -149,10 +171,12 @@ from .state import (
     ExecutionStatus,
     IncompleteTool,
     PendingRetry,
+    RecoveryState,
     ToolAttempt,
     ToolCall,
     ToolCallStatus,
     apply_event,
+    classify_recovery,
     detect_incomplete_tools,
     detect_pending_retries,
     finalize_state,
@@ -162,15 +186,25 @@ from .state import (
     resolve_status,
 )
 from .storage import SQLiteStore
+from .timeout import (
+    ResolvedTimeout,
+    TimeoutMode,
+    check_timeout,
+    declares_cancel_token,
+    is_async_callable,
+    resolve_timeout,
+    resolve_timeout_mode,
+)
 from .tools import Tool, ToolRegistry, tool
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "__version__",
     # runtime
     "Runtime",
     "Execution",
+    "AmbiguousTimeoutError",
     # journal / storage
     "EventJournal",
     "SQLiteStore",
@@ -203,6 +237,17 @@ __all__ = [
     "Sleeper",
     "RealSleeper",
     "RecordingSleeper",
+    "wait_interrupted",
+    # timeouts and cancellation
+    "CancellationToken",
+    "CANCEL_TOKEN_PARAMETER",
+    "TimeoutMode",
+    "ResolvedTimeout",
+    "check_timeout",
+    "declares_cancel_token",
+    "is_async_callable",
+    "resolve_timeout",
+    "resolve_timeout_mode",
     # idempotency
     "IdempotencyStore",
     "IdempotencyRecord",
@@ -221,12 +266,14 @@ __all__ = [
     "ToolAttempt",
     "PendingRetry",
     "IncompleteTool",
+    "RecoveryState",
     "initial_state",
     "apply_event",
     "reconstruct_state",
     "detect_incomplete_tools",
     "detect_pending_retries",
     "resolve_status",
+    "classify_recovery",
     "finalize_state",
     "replace_state",
     # tools
@@ -262,6 +309,14 @@ __all__ = [
     "ToolCallError",
     "ToolArgumentError",
     "ToolInvocationError",
+    "ToolCancelledError",
+    "ToolTimedOutError",
+    "ToolTimeoutError",
+    "TimeoutError",
+    "TimeoutConfigurationError",
+    "TimeoutEnforcementError",
+    "UnsupportedTimeoutError",
+    "AmbiguousTimeoutError",
     "RetryableToolError",
     "PermanentToolError",
     "RetryConfigurationError",

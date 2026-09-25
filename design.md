@@ -1,4 +1,114 @@
+## Milestone 4C design decisions worth your review
+
+1. **A timeout is refused for a tool that cannot be stopped, not simulated for
+   one.** The milestone's rule -- never claim a thread was terminated when it is
+   still running -- rules out the only implementation that "works" for a plain
+   `def` tool: measure elapsed time, and report. So a deadline on such a tool
+   raises `UnsupportedTimeoutError` *before* `ToolRequested`, naming the tool and
+   telling the author to write it `async def` or declare a `cancel_token`. The
+   alternative -- allow it and set `enforced=False` afterwards -- was rejected
+   because the side effect has already happened by then, and a refusal that
+   arrives after the fact is a warning, not a guarantee.
+2. **`enforced` is a fact, not a convenience flag.** `ToolTimedOut` records
+   `enforced=False` only when the runtime asked a thread to stop and it did not.
+   That single field is what decides whether a keyed call is settled `FAILED`
+   (the effect demonstrably did not complete) or left `PENDING` (it may have).
+   Without it, §6's rule would have to either block every timed-out keyed call
+   forever or guess on all of them.
+3. **`retry_on_timeout` defaults to `False`.** "It ran out of time" does not
+   imply "it would have finished given more time" -- that is a judgement about
+   the tool, and putting it in the policy makes the judgement visible and
+   reversible. `RetryPolicy(retry_on_timeout=True)` is one word, and the example
+   and README both use it.
+4. **A cancellation is never retried, and that is enforced in two places.** The
+   policy answers `CANCELLED` with `False` whatever its flags say, *and*
+   `ToolRunner.retry_decision` returns `None` before consulting the policy. The
+   duplication is deliberate: §10 is a hard rule, and it should not depend on
+   the policy's internals staying the way they are.
+5. **A cooperative tool that returns a partial result is still a timeout.** The
+   first implementation treated "the thread finished" as "it succeeded", which
+   silently handed a truncated answer back as if it were the real one and hid
+   the deadline from the retry policy entirely. `_await_stop` now asks the token
+   rather than the thread: *it was stopped* is a different fact from *it
+   finished*, and only the first is what a caller needs.
+6. **The token is opt-in by parameter name, and `**kwargs` does not count.** A
+   tool that swallows arbitrary keywords has not asked for anything, and quietly
+   handing it a token would make its journalled arguments depend on the runtime.
+   The name rather than a type check, because annotations are optional in Python
+   and asking a tool to import the type to get cancellation is a poor trade.
+7. **The token never appears in the recorded arguments.** `Tool.bind` satisfies
+   the declared parameter with a placeholder for the journal-facing binding, and
+   `bind_with_token` performs the real one for invocation. This keeps a
+   cooperative tool's history byte-identical to a non-cooperative one's, which is
+   what lets a replay reproduce it without synthesising a token.
+8. **`ToolCancelled` clears `pending_retry`.** A call cancelled *during* a
+   backoff has a `ToolRetryScheduled` behind it. Leaving that slot populated
+   would let a resume "continue" an attempt the application had already decided
+   against -- §10 expressed in the reducer rather than in a caller. The event
+   itself stays in the journal, so the decision is visible rather than erased.
+9. **`cancel()` settles the open call, and `_finish_cancelled` is idempotent
+   per call.** The cancelling thread and the call's own thread both reach the
+   cancellation, and a second `ToolCancelled` would describe something that
+   happened once. The same reasoning made a second `cancel()` a no-op rather
+   than an error: one decision should produce one event.
+10. **A successful result does not beat a cancellation.** After a tool returns,
+    the runtime re-checks the token before writing `ToolCompleted`. A `cancel()`
+    landing in that window would otherwise produce a history saying the call
+    succeeded while the execution says `CANCELLED`. The token is the authority
+    on whether the attempt was stopped; the return value is not.
+11. **The backoff wait moved to a new optional sleeper seam, and `sleep` is
+    still called.** `interruptible_sleep(delay, token)` is what the runtime
+    uses, but both implementations route through `self.sleep(delay)` when there
+    is no token. A sleeper that overrides `sleep` to inspect a wait -- which
+    several of this repo's own tests do -- kept working, and `wait_interrupted`
+    falls back to `sleep` for a 4A-era implementation with no interruptible
+    variant. The existing tests caught the first version, which bypassed `sleep`
+    entirely.
+12. **`RecoveryState` is a separate axis from `ExecutionStatus`.** `RUNNING`
+    covers three very different situations, and 4C makes all three reachable: a
+    retry was scheduled, an effect may have happened, or nothing is
+    outstanding. `classify_recovery` derives the answer from events plus the
+    idempotency store and never stores it, with a deliberate order -- a recorded
+    terminal decision wins, then ambiguity, then a pending retry. Overriding a
+    deliberate cancellation would itself be a guess.
+13. **An unenforceable timeout on a keyed call raises
+    `AmbiguousTimeoutError` and settles nothing.** It is a new public exception
+    rather than a `TimeoutEnforcementError` or an
+    `IdempotencyRecoveryRequiredError` because both halves are true and neither
+    alone is actionable: the tool was stopped too late *and* the effect is
+    unknown. The message names the key and the three resolutions, in the same
+    shape as `IdempotencyRecoveryRequiredError`.
+14. **An enforced timeout on a keyed call settles the key `FAILED`.** The
+    opposite decision to 13, and the reason `enforced` is worth having: a
+    coroutine cancelled at its `await` demonstrably did not complete its side
+    effect, so leaving the key `PENDING` would invent a recovery problem nobody
+    has and block a legitimate retry behind it.
+15. **Cross-thread cancellation required serializing transactions.**
+    `execution.cancel()` is documented as callable from another thread while a
+    tool runs, and two threads then reach the journal through one SQLite
+    connection -- where the second `BEGIN IMMEDIATE` fails with "cannot start a
+    transaction within a transaction". `SQLiteStore` now holds an `RLock` plus a
+    per-thread depth, so writers serialize and a nested transaction *joins* the
+    open one instead of restarting it. A test caught this failing two runs in
+    five; the retry loop, not the storage layer, was the original suspect.
+16. **Failure-injection tools live in `tests/`, never in the package.** §16 asks
+    for a tool that sleeps forever; shipping it inside `agent_runtime` would
+    make that hazard part of the public API. `tests/failure_tools.py` holds them
+    and nothing in the package imports it.
+17. **A call without a deadline journals no timeout fields at all.** Milestone
+    4A's `ToolRequested` payload is reproduced exactly, so an old journal and a
+    new one are directly comparable and an old one replays byte for byte. The
+    first version always wrote `timeout: null, timeout_mode: "UNSUPPORTED"`,
+    which made every no-timeout call a 4C call and broke two replay comparisons.
+18. **The async runner waits for a coroutine that swallows `CancelledError`.** A
+    tool that catches the cancellation and keeps going has chosen to ignore the
+    deadline. Killing it at that point would mean abandoning a task that may hold
+    resources, so the runtime waits and reports whatever it finally returns. The
+    alternative -- reporting a cancellation that did not happen -- is the exact
+    failure this milestone exists to prevent.
+
 ## Milestone 4A design decisions worth your review
+
 
 1. **A logical call keeps one `call_id`; the attempt number is payload, not identity.** The alternative -- a new `call_id` per attempt -- would make "attempt 3 of the same call" unrepresentable, and the milestone's own example (`call_123` with three attempts) rules it out. So `ToolRequested` is written once per call and `ToolStarted`/`ToolFailed`/`ToolCompleted` carry `attempt=N`. Every reducer defaults a missing `attempt` to 1, which is what keeps pre-Milestone-4A journals readable.
 2. **The retry decision is journalled *before* the wait.** `ToolRetryScheduled` is committed, then the sleeper is asked to wait, then the next attempt starts. That is the whole reason a crash mid-backoff is recoverable: the process that died already made the decision durable, so a new process can read it instead of having to guess whether the retry was intentional.
@@ -55,3 +165,24 @@
 - `examples/retries.py` walks through all of it, including a child process that
   dies during a backoff.
 - **Note:** `__pycache__/*.pyc` files are tracked in git in this repo. I left that alone, but you'll want a `.gitignore` and `git rm -r --cached` at some point.
+
+## Milestone 4C, in the same spirit
+
+- `agent_runtime/timeout.py` and `agent_runtime/cancellation.py` are the two new
+  modules, and they are small on purpose. `timeout.py` holds `TimeoutMode`,
+  `ResolvedTimeout` and the validation; `cancellation.py` holds the token. The
+  enforcement itself lives in `ToolRunner`, because the runner is already the one
+  place that decides *how* a tool call is carried out.
+- `tests/test_timeouts.py`, `tests/test_cancellation.py`,
+  `tests/test_reliability_integration.py` and `tests/test_reliability_crash.py`
+  cover the milestone, and `tests/failure_tools.py` holds the failure-injection
+  tools. The timeout tests run on a real clock on purpose: a fake one could not
+  distinguish a deadline that stopped a tool from one that merely measured it.
+- `examples/reliability.py` is the nine-scene walkthrough §22 asks for, ending
+  with the reliability diagram.
+- `agent-runtime cancel <execution-id>` is the operator's way to make the
+  decision durable from another process.
+- `SQLiteStore.transaction` grew a lock and a per-thread depth. That is the one
+  change in this milestone that touches a pre-existing invariant, and it exists
+  because `cancel()` is documented as callable from another thread -- see
+  decision 15 above.

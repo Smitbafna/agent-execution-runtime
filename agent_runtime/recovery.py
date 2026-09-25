@@ -42,14 +42,23 @@ from .state import (
     ExecutionStatus,
     IncompleteTool,
     PendingRetry,
+    RecoveryState,
+    ToolCall,
+    ToolCallStatus,
     apply_event,
+    classify_recovery,
     detect_incomplete_tools,
     detect_pending_retries,
     finalize_state,
     reconstruct_state,
 )
 
-__all__ = ["RecoveryInfo", "RecoverySource", "recover_execution", "apply_events_from"]
+__all__ = [
+    "RecoveryInfo",
+    "RecoverySource",
+    "recover_execution",
+    "apply_events_from",
+]
 
 #: Where a recovered state came from: a stored snapshot, or the whole journal.
 RecoverySource = Literal["checkpoint", "events"]
@@ -111,6 +120,61 @@ class RecoveryInfo:
         :meth:`~agent_runtime.execution.Execution.continue_pending_retry`).
         """
         return bool(self.pending_retries)
+
+    @property
+    def recovery_state(self) -> RecoveryState:
+        """What a restarted process should do with this execution.
+
+        Milestone 4C's §12 answer, and the one field that says all of it::
+
+            RecoveryInfo(...).recovery_state   # RecoveryState.RECOVERY_REQUIRED
+
+        Derived from the events plus the idempotency store, never stored, and
+        deliberately not a guess: a recorded terminal decision wins outright, an
+        ambiguity outranks a scheduled retry, and only then does a pending retry
+        mean "carry this on". See :func:`~agent_runtime.state.classify_recovery`.
+        """
+        return classify_recovery(
+            self.state, unresolved_keys=self.needs_idempotency_resolution
+        )
+
+    @property
+    def timed_out_calls(self) -> tuple[ToolCall, ...]:
+        """Calls whose last recorded attempt ran out of time.
+
+        Distinct from failed ones on purpose (§11): "it raised" and "it ran out
+        of time" call for different responses, and a recovery that could not
+        tell them apart would be guessing.
+        """
+        return tuple(
+            call
+            for call in self.state.tool_calls
+            if call.status is ToolCallStatus.TIMED_OUT
+        )
+
+    @property
+    def cancelled_calls(self) -> tuple[ToolCall, ...]:
+        """Calls whose last recorded attempt was cancelled.
+
+        Reported so a restart can be *seen* to leave them alone: a cancelled
+        call is a decision, and nothing here resumes or retries one.
+        """
+        return tuple(
+            call
+            for call in self.state.tool_calls
+            if call.status is ToolCallStatus.CANCELLED
+        )
+
+    @property
+    def unenforced_timeouts(self) -> tuple[ToolCall, ...]:
+        """Timed-out calls the runtime could **not** prove stopped.
+
+        The important subset of :attr:`timed_out_calls`. For these the external
+        side effect may still have happened, so a keyed call among them is a
+        ``RECOVERY_REQUIRED`` rather than a failure -- the runtime asked a
+        thread to stop and the thread kept running.
+        """
+        return tuple(call for call in self.timed_out_calls if call.timeout_enforced is False)
 
     @property
     def events_replayed(self) -> int:

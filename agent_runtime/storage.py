@@ -6,6 +6,7 @@ This module owns the connection and the schema; it knows nothing about events.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -131,6 +132,16 @@ class SQLiteStore:
         # a second claim of an idempotency key would surface as a storage error
         # rather than as "this key is already claimed".
         self._conn.execute("PRAGMA busy_timeout=5000")
+        #: Milestone 4C: ``execution.cancel()`` may be called from a different
+        #: thread than the one running the tool, so two threads can reach the
+        #: journal through this one connection. SQLite's own file lock does not
+        #: help there -- the problem is a second ``BEGIN`` on a connection that
+        #: already has one open -- so transactions are serialized here. An
+        #: ``RLock`` because a nested transaction on the same thread must be
+        #: able to join the one already running.
+        self._transaction_lock = threading.RLock()
+        #: How deep *this* thread is, so nesting joins rather than restarts.
+        self._local = threading.local()
         self._closed = False
         self.create_schema()
 
@@ -162,6 +173,15 @@ class SQLiteStore:
         ``IMMEDIATE`` takes the write lock straight away, which keeps concurrent
         writers from interleaving and losing sequence numbers.
 
+        Milestone 4C adds the lock. ``execution.cancel()`` is documented as
+        callable from another thread while a tool is running, which means two
+        threads can reach ``journal.append_event`` at the same moment -- on one
+        shared connection, where the second ``BEGIN IMMEDIATE`` would otherwise
+        fail with "cannot start a transaction within a transaction". The
+        ``RLock`` makes the writers serialize, and the per-thread depth makes a
+        nested transaction *join* the one already open rather than opening a
+        second, so a caller that nests still works.
+
         Everything in the block commits together or not at all, which makes a
         transaction a poor fit for two kinds of work:
 
@@ -173,13 +193,33 @@ class SQLiteStore:
           the statement that writes.
         """
         conn = self.connection
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield conn
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-        conn.execute("COMMIT")
+        if self._depth_of_current_thread() > 0:
+            # Already inside a transaction on *this* thread: the outer one owns
+            # the commit, so this block is just a (checked) part of it.
+            with self._transaction_lock:
+                self._local.depth += 1
+            try:
+                yield conn
+            finally:
+                with self._transaction_lock:
+                    self._local.depth -= 1
+            return
+
+        with self._transaction_lock:
+            conn.execute("BEGIN IMMEDIATE")
+            self._local.depth = 1
+            try:
+                yield conn
+            except BaseException:
+                self._local.depth = 0
+                conn.execute("ROLLBACK")
+                raise
+            self._local.depth = 0
+            conn.execute("COMMIT")
+
+    def _depth_of_current_thread(self) -> int:
+        """How many transactions the calling thread already has open."""
+        return int(getattr(self._local, "depth", 0))
 
     # -- lifecycle ------------------------------------------------------------
 

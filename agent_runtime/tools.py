@@ -25,6 +25,7 @@ import traceback as _traceback
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
+from .cancellation import CANCEL_TOKEN_PARAMETER, CancellationToken
 from .exceptions import (
     RetryConfigurationError,
     ToolAlreadyRegisteredError,
@@ -33,6 +34,7 @@ from .exceptions import (
     ToolNotFoundError,
 )
 from .retry import RetryPolicy
+from .timeout import check_timeout, declares_cancel_token, is_async_callable
 
 __all__ = [
     "Tool",
@@ -40,6 +42,7 @@ __all__ = [
     "tool",
     "make_jsonable",
     "check_retry_policy",
+    "check_timeout",
     "default_registry",
 ]
 
@@ -78,20 +81,50 @@ class Tool:
     #: (Milestone 4A). ``None`` means "whatever the caller says", which for a
     #: call that says nothing is :attr:`RetryPolicy.none`.
     retry_policy: RetryPolicy | None = None
+    #: The default deadline for calls of this tool (Milestone 4C), in seconds.
+    #: ``None`` means the call decides. A call-level ``timeout=`` always wins.
+    timeout: float | None = None
+    #: Whether this tool declared a ``cancel_token`` parameter, i.e. whether it
+    #: opted into cooperative cancellation (Milestone 4C). Resolved from the
+    #: function once, at registration, and recorded on the call.
+    cooperative: bool = False
 
     def __post_init__(self) -> None:
         check_retry_policy(self.retry_policy, tool_name=self.name)
+        object.__setattr__(
+            self, "timeout", check_timeout(self.timeout, where=f"timeout for tool {self.name!r}")
+        )
+        object.__setattr__(self, "cooperative", declares_cancel_token(self.func))
 
     @property
     def signature(self) -> inspect.Signature:
         return inspect.signature(self.func)
 
+    @property
+    def is_async(self) -> bool:
+        """Whether the tool is a coroutine function, and so cancellable."""
+        return is_async_callable(self.func)
+
+    def accepts_cancel_token(self) -> bool:
+        """Whether the runtime may pass this tool a cancellation token."""
+        return self.cooperative
+
     def bind(
         self, args: tuple[Any, ...] = (), kwargs: Mapping[str, Any] | None = None
     ) -> inspect.BoundArguments:
-        """Validate and bind call arguments against the function signature."""
+        """Validate and bind call arguments against the function signature.
+
+        The ``cancel_token`` a cooperative tool declares is satisfied here with
+        a *placeholder*, because this binding exists to produce the arguments
+        that get journalled -- and a token is a runtime concern, not part of
+        the call. :meth:`bind_with_token` performs the real binding for
+        invocation, with the live token. Both agree on every other parameter.
+        """
+        placeholders = dict(kwargs or {})
+        if self.cooperative and CANCEL_TOKEN_PARAMETER not in placeholders:
+            placeholders[CANCEL_TOKEN_PARAMETER] = None
         try:
-            bound = inspect.signature(self.func).bind(*args, **dict(kwargs or {}))
+            bound = inspect.signature(self.func).bind(*args, **placeholders)
         except TypeError as exc:
             raise ToolArgumentError(
                 f"Invalid arguments for tool {self.name!r}: {exc}", tool_name=self.name
@@ -99,9 +132,38 @@ class Tool:
         bound.apply_defaults()
         return bound
 
+    def bind_with_token(
+        self,
+        args: tuple[Any, ...] = (),
+        kwargs: Mapping[str, Any] | None = None,
+        token: CancellationToken | None = None,
+    ) -> inspect.BoundArguments:
+        """Bind for invocation, injecting ``token`` only if the tool declared it.
+
+        The injection is the whole of Milestone 4C's opt-in: a tool that does
+        not ask for a token is called with exactly the arguments it was given,
+        so its recorded arguments -- and every replay of them -- are unchanged.
+        """
+        merged = dict(kwargs or {})
+        if self.cooperative:
+            merged[CANCEL_TOKEN_PARAMETER] = (
+                token if token is not None else CancellationToken()
+            )
+        return self.bind(args, merged)
+
     def arguments_for(self, bound: inspect.BoundArguments) -> dict[str, Any]:
-        """Normalized, JSON-safe arguments -- this is what gets journalled."""
-        return make_jsonable(dict(bound.arguments))
+        """Normalized, JSON-safe arguments -- this is what gets journalled.
+
+        The injected ``cancel_token`` placeholder is dropped: a replay has to
+        reproduce the recorded arguments exactly, and it has no token to
+        substitute. What the caller asked for is the whole argument list.
+        """
+        arguments = {
+            key: value
+            for key, value in bound.arguments.items()
+            if not (key == CANCEL_TOKEN_PARAMETER and value is None and self.cooperative)
+        }
+        return make_jsonable(arguments)
 
     def invoke(self, bound: inspect.BoundArguments) -> Any:
         return self.func(*bound.args, **bound.kwargs)
@@ -131,6 +193,7 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     retry_policy: RetryPolicy | None = None,
+    timeout: float | None = None,
 ) -> Any:
     """Register a function as a tool. Works bare or called::
 
@@ -142,6 +205,9 @@ def tool(
 
         @tool(retry_policy=RetryPolicy(max_attempts=3))
         def fetch_data(url: str): ...
+
+        @tool(timeout=5.0)                      # every call gets 5 seconds
+        async def slow_tool(): ...
     """
 
     def decorator(target: Callable[..., Any]) -> Tool:
@@ -153,6 +219,7 @@ def tool(
             func=target,
             description=doc or "",
             retry_policy=check_retry_policy(retry_policy, tool_name=name or target.__name__),
+            timeout=timeout,
         )
 
     if func is None:
@@ -223,13 +290,15 @@ class ToolRegistry:
         if not isinstance(item, Tool):
             item = tool(item, name=name)
         elif name is not None and name != item.name:
-            # Renaming must not drop the tool's retry policy: it describes the
-            # tool, not the name it is filed under.
+            # Renaming must not drop what describes the tool: its retry policy
+            # and its default timeout are properties of the function, not of
+            # the name it happens to be filed under.
             item = Tool(
                 name=name,
                 func=item.func,
                 description=item.description,
                 retry_policy=item.retry_policy,
+                timeout=item.timeout,
             )
         if item.name in self._tools:
             raise ToolAlreadyRegisteredError(f"Tool {item.name!r} is already registered")
